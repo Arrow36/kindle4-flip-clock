@@ -1,0 +1,9 @@
+{
+  "items": [
+    {
+      "name": "Flip Clock",
+      "priority": -999,
+      "action": "./src/start.sh > /tmp/root/kclock.log 2>&1"
+    }
+  ]
+}

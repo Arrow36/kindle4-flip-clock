@@ -1,0 +1,20 @@
+# Runtime output
+kclock/output/*
+!kclock/output/.gitkeep
+
+# Kindle-side logs and state
+*.log
+*.pid
+**/EXIT
+**/KEY_EVENT
+*.tmp
+
+# Local backups and release archives
+*.backup-*
+*.shortcuts-backup-*
+dist/
+*.zip
+
+# OS metadata
+.DS_Store
+Thumbs.db

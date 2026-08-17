@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="750" viewBox="0 0 1000 750" role="img" aria-labelledby="title desc">
+  <title id="title">Kindle 4 Flip Clock preview</title>
+  <desc id="desc">A grayscale landscape flip clock showing date, lunar date, time, and battery.</desc>
+  <rect width="1000" height="750" rx="42" fill="#2e2e2d"/>
+  <rect x="22" y="22" width="956" height="706" rx="10" fill="#f2f1eb"/>
+  <g fill="#171717" font-family="Douyin Sans, Noto Sans CJK SC, Microsoft YaHei, sans-serif">
+    <text x="58" y="84" font-size="34" font-weight="700">2026年8月18日　星期二　农历七月初六</text>
+  </g>
+  <g fill="#171717">
+    <rect x="32" y="205" width="212" height="325" rx="14"/>
+    <rect x="252" y="205" width="212" height="325" rx="14"/>
+    <rect x="536" y="205" width="212" height="325" rx="14"/>
+    <rect x="756" y="205" width="212" height="325" rx="14"/>
+  </g>
+  <g fill="#f2f1eb" font-family="Douyin Sans, Arial Black, sans-serif" font-size="285" font-weight="700" text-anchor="middle">
+    <text x="138" y="473">0</text>
+    <text x="358" y="473">3</text>
+    <text x="642" y="473">1</text>
+    <text x="862" y="473">4</text>
+  </g>
+  <g stroke="#777" stroke-width="3">
+    <line x1="32" y1="367.5" x2="244" y2="367.5"/>
+    <line x1="252" y1="367.5" x2="464" y2="367.5"/>
+    <line x1="536" y1="367.5" x2="748" y2="367.5"/>
+    <line x1="756" y1="367.5" x2="968" y2="367.5"/>
+  </g>
+  <g fill="#171717">
+    <circle cx="500" cy="322" r="11"/>
+    <circle cx="500" cy="414" r="11"/>
+  </g>
+  <g fill="#171717" font-family="Douyin Sans, Arial, sans-serif" font-size="31" font-weight="700">
+    <text x="820" y="676">86.0%</text>
+    <rect x="912" y="645" width="48" height="29" rx="2" fill="none" stroke="#171717" stroke-width="4"/>
+    <rect x="960" y="653" width="6" height="13"/>
+    <rect x="918" y="651" width="34" height="17"/>
+  </g>
+</svg>
