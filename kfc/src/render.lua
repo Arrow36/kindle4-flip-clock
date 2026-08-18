@@ -10,13 +10,33 @@ local band, bor, lshift = bit.band, bit.bor, bit.lshift
 local output = assert(arg[1], "missing output path")
 local orientation = arg[2] or "landscape_right"
 local theme = arg[3] or "light"
-local info_text = arg[4] or ""
-local period = arg[5] or ""
-local battery_level = tonumber(arg[6]) or 0
-local top_digits = {arg[7] or "0", arg[8] or "0", arg[9] or "0", arg[10] or "0"}
-local bottom_digits = {arg[11] or "0", arg[12] or "0", arg[13] or "0", arg[14] or "0"}
-local show_help = arg[15] == "1"
-local font_path = "/mnt/us/extensions/kclock/fonts/DouyinSansBold.ttf"
+local target_epoch = tonumber(arg[4]) or os.time()
+local battery_level = tonumber(arg[5]) or 0
+local show_help = arg[6] == "1"
+local hour_mode = arg[7] == "12" and "12" or "24"
+local font_path = "/mnt/us/extensions/kfc/fonts/DouyinSansBold.ttf"
+local lunar = dofile("/mnt/us/extensions/kfc/src/lunar.lua")
+
+local clock = os.date("*t", target_epoch)
+local weekday_names = {"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
+local lunar_text = lunar.convert(clock.year, clock.month, clock.day)
+local info_text = string.format("%d年%d月%d日  %s  农历%s",
+    clock.year, clock.month, clock.day, weekday_names[clock.wday] or "星期六", lunar_text)
+
+local period = ""
+local display_hour = clock.hour
+if hour_mode == "12" then
+    period = clock.hour < 12 and "AM" or "PM"
+    display_hour = clock.hour % 12
+    if display_hour == 0 then display_hour = 12 end
+end
+local hour_text = string.format("%02d", display_hour)
+local minute_text = string.format("%02d", clock.min)
+local top_digits = {
+    string.sub(hour_text, 1, 1), string.sub(hour_text, 2, 2),
+    string.sub(minute_text, 1, 1), string.sub(minute_text, 2, 2),
+}
+local bottom_digits = top_digits
 
 battery_level = math.max(0, math.min(100, battery_level))
 
@@ -163,7 +183,7 @@ if show_help then
         landscape_right = "横屏·按键在右",
         landscape_left = "横屏·按键在左",
     }
-    local hour_name = arg[16] == "12" and "12 小时制" or "24 小时制"
+    local hour_name = hour_mode == "12" and "12 小时制" or "24 小时制"
     local theme_name = light and "浅色" or "深色"
     local box_x, box_y, box_width, box_height
     local text_x, header_baseline, line_baseline, line_gap
@@ -178,7 +198,7 @@ if show_help then
     canvas:paintRoundedRect(box_x, box_y, box_width, box_height, paper, 16)
     canvas:paintBorder(box_x, box_y, box_width, box_height, 4, ink)
     local header_face = FT.newFaceSize(font_path, landscape and 34 or 29)
-    draw_text(canvas, header_face, "Flip Clock 快捷键", text_x, header_baseline, ink)
+    draw_text(canvas, header_face, "kfc 快捷键", text_x, header_baseline, ink)
 
     local lines = {
         "屏幕方向：" .. (orientation_names[orientation] or orientation),
@@ -188,8 +208,9 @@ if show_help then
         "左侧上一页 / 下一页：切换屏幕方向",
         "右侧可用翻页键：切换浅色 / 深色",
         "五向键确认：切换 12 / 24 小时制",
+        "键盘键：立即联网校时",
         "菜单键：关闭说明",
-        "返回键 / Home：退出时钟",
+        "返回键：强制全刷　Home：退出时钟",
     }
     for _, line in ipairs(lines) do
         if line ~= "" then

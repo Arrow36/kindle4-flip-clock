@@ -60,51 +60,6 @@ local function days_from_civil(year, month, day)
   return era * 146097 + doe
 end
 
-local year = tonumber(arg[1])
-local month = tonumber(arg[2])
-local day = tonumber(arg[3])
-if not year or not month or not day or year < 1900 or year > 2100 then
-  io.write("未知")
-  os.exit(0)
-end
-
-local offset = days_from_civil(year, month, day) - days_from_civil(1900, 1, 31)
-if offset < 0 then
-  io.write("未知")
-  os.exit(0)
-end
-
-local lunar_year = 1900
-while lunar_year <= 2100 do
-  local span = year_days(lunar_year)
-  if offset < span then break end
-  offset = offset - span
-  lunar_year = lunar_year + 1
-end
-
-local leap = leap_month(lunar_year)
-local lunar_month = 1
-local is_leap = false
-while lunar_month <= 12 do
-  local span
-  if leap > 0 and lunar_month == leap + 1 and not is_leap then
-    lunar_month = lunar_month - 1
-    is_leap = true
-    span = leap_days(lunar_year)
-  else
-    span = month_days(lunar_year, lunar_month)
-  end
-
-  if offset < span then break end
-  offset = offset - span
-
-  if is_leap and lunar_month == leap then
-    is_leap = false
-  end
-  lunar_month = lunar_month + 1
-end
-
-local lunar_day = offset + 1
 local month_names = {"正月","二月","三月","四月","五月","六月","七月","八月","九月","十月","冬月","腊月"}
 local digits = {"一","二","三","四","五","六","七","八","九"}
 local function day_name(value)
@@ -116,4 +71,54 @@ local function day_name(value)
   return "廿" .. digits[value - 20]
 end
 
-io.write((is_leap and "闰" or "") .. month_names[lunar_month] .. day_name(lunar_day))
+local M = {}
+
+function M.convert(year, month, day)
+  year, month, day = tonumber(year), tonumber(month), tonumber(day)
+  if not year or not month or not day or year < 1900 or year > 2100 then
+    return "未知"
+  end
+
+  local offset = days_from_civil(year, month, day) - days_from_civil(1900, 1, 31)
+  if offset < 0 then return "未知" end
+
+  local lunar_year = 1900
+  while lunar_year <= 2100 do
+    local span = year_days(lunar_year)
+    if offset < span then break end
+    offset = offset - span
+    lunar_year = lunar_year + 1
+  end
+  if lunar_year > 2100 then return "未知" end
+
+  local leap = leap_month(lunar_year)
+  local lunar_month = 1
+  local is_leap = false
+  while lunar_month <= 12 do
+    local span
+    if leap > 0 and lunar_month == leap + 1 and not is_leap then
+      lunar_month = lunar_month - 1
+      is_leap = true
+      span = leap_days(lunar_year)
+    else
+      span = month_days(lunar_year, lunar_month)
+    end
+
+    if offset < span then break end
+    offset = offset - span
+
+    if is_leap and lunar_month == leap then is_leap = false end
+    lunar_month = lunar_month + 1
+  end
+
+  if lunar_month < 1 or lunar_month > 12 then return "未知" end
+  return (is_leap and "闰" or "") .. month_names[lunar_month] .. day_name(offset + 1)
+end
+
+-- Preserve the original command-line interface while also allowing the frame
+-- renderer to reuse this module for an arbitrary target minute.
+if arg and arg[0] and string.match(arg[0], "lunar%.lua$") then
+  io.write(M.convert(arg[1], arg[2], arg[3]))
+end
+
+return M

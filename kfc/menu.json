@@ -1,0 +1,9 @@
+{
+  "items": [
+    {
+      "name": "kfc",
+      "priority": -999,
+      "action": "./src/start.sh"
+    }
+  ]
+}

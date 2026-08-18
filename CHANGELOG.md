@@ -2,6 +2,47 @@
 
 All notable changes to this project are documented here.
 
+## 2.2.3 - 2026-08-18
+
+### Changed
+
+- Renamed the extension from `kclock` to lowercase `kfc`
+- The install path is now `/mnt/us/extensions/kfc`, runtime state is in `/tmp/kfc`, and the main log is `kfc/logs/kfc.log`
+- Updated the KUAL menu name, extension ID, renderer paths, documentation, and release directory to use `kfc`
+
+## 2.2.2 - 2026-08-18
+
+### Fixed
+
+- Resume time is now compared with the scheduled RTC wake time
+- A hardware wake occurring at least about two seconds early is treated as a power-button wake and restarts the ten-minute awake interval
+- Normal minute RTC wakes do not restart the awake interval, so the clock returns to suspend after updating and pre-rendering
+
+## 2.2.1 - 2026-08-18
+
+### Changed
+
+- Manual synchronization now uses KOReader LuaSocket SNTP directly instead of probing `ntpdate` and `ntpd`
+- After ten minutes without a physical-key press, the clock uses RTC Suspend-to-RAM between minute updates
+- The power button can wake the suspended Kindle; ordinary physical keys restart the interval while the clock is already awake
+- RTC wake is scheduled shortly before the next absolute minute boundary; unsupported RTC suspend falls back to awake waiting
+
+## 2.2.0 - 2026-08-18
+
+### Added
+
+- Background pre-rendering of the next minute for direct publication at the absolute minute boundary
+- Manual synchronization on the Kindle Keyboard key, trying `ntpdate`, `ntpd`, then KOReader LuaSocket SNTP
+- Alibaba Cloud NTP defaults: `ntp1.aliyun.com`, `ntp2.aliyun.com`, and `ntp.aliyun.com`
+- Back-key forced full refresh using the upstream clear-then-redraw sequence
+
+### Changed
+
+- Wi-Fi remains off while the clock runs, is enabled temporarily for synchronization, and returns to its launch-time state on exit
+- Startup, hourly boundaries, and successful synchronization use a full clear and redraw
+- Frames, PID files, and key/synchronization events now live in `/tmp/kclock`
+- Launcher and runtime logs now persist under `kclock/logs` for USB access
+
 ## 2.1.0 - 2026-08-18
 
 Initial public release of the custom Kindle 4 flip clock edition.

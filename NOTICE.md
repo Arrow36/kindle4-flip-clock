@@ -2,13 +2,13 @@
 
 ## Douyin Sans / 抖音美好体
 
-The bundled `kclock/fonts/DouyinSansBold.ttf` is copied unchanged from the official [ByteDance Fonts repository](https://github.com/bytedance/fonts/tree/main/DouyinSans).
+The bundled `kfc/fonts/DouyinSansBold.ttf` is copied unchanged from the official [ByteDance Fonts repository](https://github.com/bytedance/fonts/tree/main/DouyinSans).
 
 Copyright (c) 2023 Beijing Zitiao Network Technology Co. Ltd.
 
 Reserved Font Names: "Douyin", "抖音", and "抖音美好".
 
-The font is distributed under the SIL Open Font License, Version 1.1. The required license text is included at `kclock/fonts/OFL.txt`. The font is not relicensed under the repository's MIT License.
+The font is distributed under the SIL Open Font License, Version 1.1. The required license text is included at `kfc/fonts/OFL.txt`. The font is not relicensed under the repository's MIT License.
 
 ## KOReader
 

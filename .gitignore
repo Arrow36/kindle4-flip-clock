@@ -1,12 +1,9 @@
-# Runtime output
-kclock/output/*
-!kclock/output/.gitkeep
-
 # Kindle-side logs and state
 *.log
 *.pid
 **/EXIT
 **/KEY_EVENT
+**/time_sync.result
 *.tmp
 
 # Local backups and release archives
