@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## 2.2.4 - 2026-08-20
+
+### Fixed
+
+- A virtual minute clock now advances from the startup or SNTP anchor instead of deriving every frame from the post-resume system clock
+- RTC alarms now follow an absolute PMIC schedule and compensate the next relative delay after an early or late resume
+- Frame metadata binds the sampled battery level to its target minute so stale pre-rendered images are rejected
+
+### Changed
+
+- The startup and post-key awake interval now defaults to three minutes instead of ten
+- The packaged defaults now use left landscape orientation, 12-hour time, and the dark theme
+- Partial and full E Ink refreshes start before the virtual minute boundary so the visible transition is centered around it
+- RTC diagnostics now record planned and actual PMIC epochs, resume lateness, selected relative delay, frame battery samples, and display timing
+
 ## 2.2.3 - 2026-08-18
 
 ### Changed

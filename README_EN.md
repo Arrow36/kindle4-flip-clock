@@ -2,7 +2,7 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.2.3** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.2.4** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
@@ -17,7 +17,7 @@ The current release pre-renders the next minute in the background and publishes 
 - Light and dark themes
 - Gregorian date, weekday, Chinese lunar date, and battery percentage
 - ByteDance Douyin Sans font
-- Background pre-rendering with direct publication at each absolute minute boundary
+- Background pre-rendering with the visible E Ink transition centered around each virtual minute boundary
 - Clear-then-redraw full refresh at startup, every hour, and after successful synchronization
 - Back forces a full refresh; Home safely exits
 - Keyboard-key manual synchronization directly through KOReader LuaSocket SNTP
@@ -25,7 +25,8 @@ The current release pre-renders the next minute in the background and publishes 
 - Persistent settings and physical-key shortcuts
 - First-frame validation before the Kindle framework is stopped
 - Wi-Fi off while the clock runs, temporarily enabled for synchronization, and restored to its launch-time state on exit
-- RTC Suspend-to-RAM after ten minutes without a physical-key press; the power button wakes the Kindle and restarts the awake interval
+- RTC Suspend-to-RAM after three minutes without a physical-key press; the power button wakes the Kindle and restarts the awake interval
+- A virtual minute clock controls displayed time while the RTC follows a phase-corrected absolute PMIC schedule; resume never rewrites the system clock
 - Runtime frames, PIDs, and events in `/tmp/kfc`; persistent USB-visible logs in `kfc/logs`
 
 ## Tested setup
@@ -71,21 +72,23 @@ The directional pad and right next-page key are currently unassigned.
 `kfc/settings.conf` contains:
 
 ```sh
-ORIENTATION=landscape_right
-HOUR_MODE=24
-THEME=light
+ORIENTATION=landscape_left
+HOUR_MODE=12
+THEME=dark
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=600
+IDLE_SUSPEND_SECONDS=180
 RTC_WAKE_LEAD_SECONDS=3
+PARTIAL_REFRESH_DURATION_MS=800
+FULL_REFRESH_DURATION_MS=1400
 ```
 
-`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `IDLE_SUSPEND_SECONDS` accepts 60–3600 seconds, and `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds.
+`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `IDLE_SUSPEND_SECONDS` accepts 60–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, and both refresh-duration estimates accept 100–5000 milliseconds.
 
 ## Rendering
 
-The extension uses KOReader's LuaJIT, FreeType, and BlitBuffer to produce 600×800 grayscale PNGs in `/tmp/kfc`. After displaying the current frame, it renders the next minute in a cancellable background process. At the absolute boundary it displays the prepared image directly; a synchronous render is used only as a fallback. Startup, each hour, successful time synchronization, and Back use the upstream `eips -c` followed by `eips -g` clear-then-redraw sequence. After ten minutes without a key press, the clock suspends between minute updates and schedules RTC wake shortly before the next boundary. A resume at least about two seconds earlier than the RTC schedule is treated as a power-button wake and starts a new ten-minute awake interval. Normal minute RTC wakes do not restart the interval. Home restores Wi-Fi, the sleep policy, and the Kindle framework before exit.
+The extension uses KOReader's LuaJIT, FreeType, and BlitBuffer to produce 600×800 grayscale PNGs in `/tmp/kfc`. After displaying the current frame, it renders the next minute with a battery-and-target metadata record in a cancellable background process; a synchronous render is used only as a fallback. Startup and successful SNTP synchronization anchor a virtual minute clock. RTC alarms then follow an absolute PMIC-second schedule, while each relative delay is recomputed from the current PMIC value so one late resume cannot shift later cycles. Partial and full E Ink updates start half of their configured visible duration before the virtual boundary. After three minutes without a key press, the clock suspends between updates. A resume at least about two seconds earlier than the RTC schedule is treated as a power-button wake and starts a new three-minute awake interval. Normal RTC wakes neither restart the interval nor rewrite the system clock. Home restores Wi-Fi, the sleep policy, and the Kindle framework before exit.
 
 Logs:
 
@@ -101,7 +104,7 @@ Logs:
 ## Known limitations
 
 - Designed for the Kindle 4 Non-Touch 600×800 framebuffer and its physical key codes.
-- RTC low-power operation requires `/sys/devices/platform/mxc_rtc.0/wakeup_enable`; when unavailable, the clock remains awake and continues updating.
+- RTC low-power phase scheduling requires `/sys/devices/platform/mxc_rtc.0/wakeup_enable` and the adjacent `rtc_pmic_epoch_time`; when unavailable, the clock remains awake and uses the system clock for scheduling.
 - Battery reading depends on the Kindle 4 `gasgauge-info -c` output.
 - Lunar dates are supported from 1900 through 2100.
 - Seconds and per-second updates are intentionally omitted.

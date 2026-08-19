@@ -2,7 +2,7 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.2.3** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.2.4** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
@@ -18,7 +18,7 @@
 - 公历日期、星期和农历日期
 - 电量百分比精确到小数点后一位（Kindle 4 的电量来源仍为整数，因此末位通常是 `.0`）
 - 抖音美好体，数字、AM/PM 和电量文字使用同一字体
-- 提前生成下一分钟画面，在绝对整分钟边界直接显示
+- 提前生成下一分钟画面，并让墨水屏刷新过程跨过虚拟整分钟边界
 - 启动、每个整点和成功校时后执行全屏清除并重画
 - 返回键可随时强制全刷；Home 安全退出
 - 键盘键直接使用 KOReader LuaSocket SNTP 手动校时
@@ -26,7 +26,8 @@
 - 实体键实时控制，设置会写入 `settings.conf` 并在下次启动时保留
 - 启动前先验证首帧，渲染失败时不会先关闭 Kindle 原界面
 - 时钟运行时关闭 Wi-Fi，仅校时时临时开启；退出后恢复启动前状态
-- 启动或最后一次按键后清醒 10 分钟，随后在分钟间隔进入 RTC Suspend；电源键可人工唤醒
+- 启动或最后一次按键后清醒 3 分钟，随后在分钟间隔进入 RTC Suspend；电源键可人工唤醒
+- 显示时间由启动或 SNTP 校准建立的虚拟分钟时钟推进；RTC 只按固定 PMIC 相位唤醒，不再在恢复后修改系统时间
 - 帧、PID 和事件位于 `/tmp/kfc`，日志持久保存在 `kfc/logs`
 
 ## 已测试环境
@@ -84,14 +85,16 @@
 
 1. 启动时在 `/tmp/kfc` 生成并验证当前帧；成功后停止 Kindle framework并全屏显示。
 2. 当前帧显示后，后台生成下一分钟的 600×800 灰度 PNG；设置改变时会取消过时的预生成任务。
-3. 主循环按绝对时间等待，到达整分钟边界后直接显示已经准备好的下一帧；若预生成失败则现场重画兜底。
+3. 主循环由虚拟分钟时钟决定下一帧；普通 RTC 周期严格推进 60 秒，不使用恢复后的系统时间重新推导显示分钟。
 4. 启动、每个整点和成功校时后执行 `eips -c` 清屏，再用 `eips -g` 完整重画。
 5. 返回键立即对当前画面执行同样的清屏重画；普通分钟和设置变化只画一次 PNG。
 6. 键盘键启动后台校时：临时打开 Wi-Fi，直接运行 KOReader LuaSocket SNTP，结束后关闭 Wi-Fi。
-7. 启动或清醒期间的任意实体键会开始 10 分钟清醒计时；无按键达到 10 分钟后，下一分钟预生成完成便进入 RTC Suspend，并在分钟边界前 3 秒或电源键触发时唤醒。
-8. 如果实际恢复时间比 RTC 计划时间至少早约 2 秒，则判定为电源键等人工唤醒，立即重新开始 10 分钟清醒计时；正常的分钟 RTC 唤醒不会重置计时。
-9. 能产生输入事件的唤醒按键会继续交给原有按键逻辑处理；电源键即使不进入 `waitforkey`，也能通过提前恢复时间被识别。
-10. Home 退出后恢复 Wi-Fi 原状态、休眠策略和 Kindle framework。
+7. 启动或清醒期间的任意实体键会开始 3 分钟清醒计时；无按键达到 3 分钟后，下一分钟预生成完成便进入 RTC Suspend，并在分钟边界前 3 秒或电源键触发时唤醒。
+8. RTC 计划使用 PMIC 的绝对秒相位；每次写入的相对倒计时等于“下次计划 PMIC 秒－当前 PMIC 秒”，因此单次迟到不会传给下一轮。
+9. 普通刷新默认提前约半个可见刷新耗时开始；整点全刷使用独立的耗时参数，使画面变化尽量以整分钟为中心。
+10. 如果实际恢复时间比 RTC 计划时间至少早约 2 秒，则判定为电源键等人工唤醒并重新开始 3 分钟清醒计时；普通 RTC 唤醒不会重置计时。
+11. 能产生输入事件的唤醒按键会继续交给原有按键逻辑处理；电源键即使不进入 `waitforkey`，也能通过提前恢复时间被识别。
+12. Home 退出后恢复 Wi-Fi 原状态、休眠策略和 Kindle framework。
 
 这里的“重新启动 framework”只是恢复 Kindle 图形界面，不是重启整台设备。
 
@@ -100,14 +103,16 @@
 配置文件位于 `kfc/settings.conf`：
 
 ```sh
-ORIENTATION=landscape_right
-HOUR_MODE=24
-THEME=light
+ORIENTATION=landscape_left
+HOUR_MODE=12
+THEME=dark
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=600
+IDLE_SUSPEND_SECONDS=180
 RTC_WAKE_LEAD_SECONDS=3
+PARTIAL_REFRESH_DURATION_MS=800
+FULL_REFRESH_DURATION_MS=1400
 ```
 
 可用值：
@@ -118,8 +123,10 @@ RTC_WAKE_LEAD_SECONDS=3
 - `TIMEZONE`：POSIX TZ 字符串；中国标准时间使用 `CST-8`
 - `TIME_SYNC_TIMEOUT`：手动校时等待 Wi-Fi 联网的最长秒数，允许 10–180
 - `NTP_SERVERS`：NTP 服务器列表，默认使用三个阿里云公网地址
-- `IDLE_SUSPEND_SECONDS`：最后一次实体键后保持清醒的秒数，默认 600，允许 60–3600
+- `IDLE_SUSPEND_SECONDS`：最后一次实体键后保持清醒的秒数，默认 180，允许 60–3600
 - `RTC_WAKE_LEAD_SECONDS`：分钟边界前提前唤醒的秒数，默认 3，允许 1–10
+- `PARTIAL_REFRESH_DURATION_MS`：普通分钟刷新预计可见耗时，默认 800 毫秒，允许 100–5000
+- `FULL_REFRESH_DURATION_MS`：整点清屏重画预计可见耗时，默认 1400 毫秒，允许 100–5000
 
 POSIX TZ 的正负号与常见 UTC 写法相反。例如 UTC+8 写作 `CST-8`。
 
@@ -205,7 +212,7 @@ kindle4-flip-clock/
 ## 已知限制
 
 - 目前只针对 Kindle 4 Non-Touch 的 600×800 屏幕与实体键码。
-- RTC 低功耗模式依赖 Kindle 4 的 `/sys/devices/platform/mxc_rtc.0/wakeup_enable`；不可用时会保持清醒并继续正常更新时间。
+- RTC 低功耗和相位调度依赖 Kindle 4 的 `/sys/devices/platform/mxc_rtc.0/wakeup_enable` 与同目录下的 `rtc_pmic_epoch_time`；不可用时会保持清醒并使用系统时间继续更新。
 - 电量读取依赖 `gasgauge-info -c`；其他型号输出格式可能不同。
 - 农历换算支持 1900–2100 年。
 - 没有秒数，也没有逐秒刷新；这是为墨水屏残影、性能和功耗做出的选择。
