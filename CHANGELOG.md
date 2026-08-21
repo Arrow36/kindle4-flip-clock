@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## 2.4.5 - 2026-08-21
+
+### Added
+
+- A persistent LuaJIT renderer with a FIFO command protocol and startup `PING/PONG` handshake
+- Cached 0–9 digit cards and next-minute preparation of only the changed one- or two-card region
+- Direct 8-bit framebuffer writes and Kindle 4 `FBIO_EINK_UPDATE_DISPLAY_AREA` partial refreshes, with an MXCFB compatibility branch
+- Centisecond refresh diagnostics from `/proc/uptime`, including start, target-boundary, return time, offsets, and RTC lateness
+- Bounded persistent logs, one previous-session log, optional debug logging, and renderer/RTC fallback diagnostics
+- Hourly gas-gauge settling and sampling so battery changes do not force ordinary minutes into full redraws
+
+### Changed
+
+- Startup now synchronizes time before the first frame and always turns Wi-Fi off afterward
+- The idle interval is 60 seconds and the RTC wake margin is fixed at three seconds
+- Ordinary minutes no longer encode PNG files; they publish the prepared changed-digit buffer directly
+- Refresh scheduling uses fixed 800 ms partial and 1400 ms full visible-duration estimates; runtime driver timings never modify them
+- The persistent renderer retains FreeType faces, digit caches, the framebuffer mapping, and the prepared region between minutes
+
+### Fixed
+
+- FIFO creation now tries `mkfifo`, BusyBox, and `mknod`, and falls back safely if the persistent worker cannot start
+- Partial-refresh failures disable the optimization for the current session and fall back to validated full PNG rendering
+- Normal logs are limited to approximately one summary record per minute and rotate before unbounded growth
+
+### Known limitations
+
+- Kindle 4 suspend/resume can make the system wall clock run fast; periodic SNTP is still needed for long unattended runs
+- The eInkFB ioctl may return before the visible waveform finishes, so recorded return time is not the physical end of screen motion
+- A manual SNTP operation that crosses a minute boundary can briefly race with minute publication; the subsequent re-anchor and full refresh recover the display
+
 ## 2.2.4 - 2026-08-20
 
 ### Fixed

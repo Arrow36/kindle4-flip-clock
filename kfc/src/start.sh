@@ -1,5 +1,4 @@
 #!/bin/sh
-
 BASE_DIR="/mnt/us/extensions/kfc"
 SRC_DIR="$BASE_DIR/src"
 SETTINGS_FILE="$BASE_DIR/settings.conf"
@@ -10,6 +9,7 @@ LAUNCHER_LOG="$LOG_DIR/launcher.log"
 CURRENT_FRAME="$RUNTIME_DIR/current.png"
 NEXT_FRAME="$RUNTIME_DIR/next.png"
 NEXT_RENDER_WORK="$RUNTIME_DIR/next.rendering.png"
+NEXT_RENDER_RESULT="$RUNTIME_DIR/next.rendering.meta"
 NEXT_FRAME_META="$RUNTIME_DIR/next.meta"
 EXIT_FILE="$RUNTIME_DIR/EXIT"
 KEY_EVENT_FILE="$RUNTIME_DIR/KEY_EVENT"
@@ -19,27 +19,40 @@ NEXT_RENDER_PID_FILE="$RUNTIME_DIR/next_render.pid"
 SYNC_PID_FILE="$RUNTIME_DIR/time_sync.pid"
 SYNC_RESULT_FILE="$RUNTIME_DIR/time_sync.result"
 SYNC_RESULT_TMP="$RUNTIME_DIR/time_sync.result.tmp"
+RENDER_REQUEST_FIFO="$RUNTIME_DIR/render.request"
+RENDER_SERVER_PID_FILE="$RUNTIME_DIR/render_server.pid"
+PARTIAL_DISABLED_FILE="$RUNTIME_DIR/partial.disabled"
 RTC_PATH="/sys/devices/platform/mxc_rtc.0/wakeup_enable"
 RTC_PMIC_EPOCH_PATH="/sys/devices/platform/mxc_rtc.0/rtc_pmic_epoch_time"
 POWER_STATE_PATH="/sys/power/state"
-
 ORIENTATION=landscape_right
 HOUR_MODE=24
 THEME=light
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=180
+IDLE_SUSPEND_SECONDS=60
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
-
+# Let the K4 gas-gauge driver refresh after the hourly full-screen refresh.
+# The 00-minute frame is shown on time, then the device stays awake long
+# enough to sample a fresh battery value for the 01-minute frame.
+BATTERY_REFRESH_SETTLE_SECONDS=40
+SETTINGS_VERSION=""
+CURRENT_SETTINGS_VERSION=4
+SETTINGS_MIGRATED=0
+DEBUG_LOG=0
+LOG_MAX_BYTES=524288
+LAUNCHER_LOG_MAX_BYTES=131072
 HELP_VISIBLE=0
 BATTERY_LEVEL=0
 CURRENT_FRAME_EPOCH=0
 CURRENT_FRAME_BATTERY=0
 NEXT_FRAME_EPOCH=0
 NEXT_FRAME_READY=0
+NEXT_FRAME_KIND=""
+NEXT_FRAME_CHANGED_DIGITS=0
 NEXT_FRAME_RENDER_EPOCH=0
 NEXT_FRAME_BATTERY=0
 NEXT_DISPLAY_CLOCK=0
@@ -47,6 +60,9 @@ CLOCK_SOURCE=system
 KEY_PID=""
 NEXT_RENDER_PID=""
 SYNC_PID=""
+RENDER_SERVER_PID=""
+RENDER_SERVER_READY=0
+RENDER_REQUEST_SEQUENCE=0
 KEY_ACTION=""
 WAIT_REASON=""
 ORIGINAL_WIFI_STATE=""
@@ -54,31 +70,72 @@ LAST_INTERACTION_CLOCK=0
 RTC_FAILURE_LOGGED=0
 RTC_WOKE_EARLY=0
 RTC_RESUME_LATENESS_SECONDS=0
+REFRESH_SCHEDULE_EPOCH=0
+REFRESH_BOUNDARY_UPTIME_CS=""
+REFRESH_PLANNED_START_UPTIME_CS=""
+REFRESH_PROFILE_KIND=""
+REFRESH_DURATION_MS=0
 CLEANED=0
 UI_STOPPED=0
 
 is_uint() {
   case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
 }
-
 log_message() {
-  mkdir -p "$LOG_DIR"
-  echo "[$(date)] $1" >> "$LOG_FILE"
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+log_debug() {
+  [ "$DEBUG_LOG" = "1" ] && log_message "debug: $1"
+  return 0
+}
+file_size_bytes() {
+  [ -f "$1" ] || { echo 0; return; }
+  wc -c < "$1" 2>/dev/null | tr -d ' '
+}
+truncate_log_if_oversize() {
+  ROTATE_PATH="$1"
+  ROTATE_LIMIT="$2"
+  ROTATE_SIZE=$(file_size_bytes "$ROTATE_PATH")
+  is_uint "$ROTATE_SIZE" || return 1
+  if [ "$ROTATE_SIZE" -gt "$ROTATE_LIMIT" ]; then
+    : > "$ROTATE_PATH"
+    return 0
+  fi
+  return 1
+}
+start_new_session_log() {
+  truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"
+  if [ -s "$LOG_FILE" ]; then
+    rm -f "$LOG_FILE.1"
+    mv "$LOG_FILE" "$LOG_FILE.1"
+  fi
+  : > "$LOG_FILE"
 }
 
 . "$SRC_DIR/time_sync.sh"
 
 load_settings() {
   [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
-
+  is_uint "$SETTINGS_VERSION" || SETTINGS_VERSION=0
+  if [ "$SETTINGS_VERSION" -lt "$CURRENT_SETTINGS_VERSION" ]; then
+    # Version 3 shortened the idle interval; version 4 restores a full
+    # three-second RTC wake margin for the Kindle 4's observed resume delay.
+    [ "$SETTINGS_VERSION" -lt 3 ] && IDLE_SUSPEND_SECONDS=60
+    RTC_WAKE_LEAD_SECONDS=3
+    SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
+    SETTINGS_MIGRATED=1
+  fi
   case "$ORIENTATION" in portrait|portrait_down|landscape_right|landscape_left) ;; *) ORIENTATION=landscape_right ;; esac
   case "$HOUR_MODE" in 12|24) ;; *) HOUR_MODE=24 ;; esac
   case "$THEME" in light|dark) ;; *) THEME=light ;; esac
   is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=45
-  is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=180
+  is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=60
   is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=3
   is_uint "$PARTIAL_REFRESH_DURATION_MS" || PARTIAL_REFRESH_DURATION_MS=800
   is_uint "$FULL_REFRESH_DURATION_MS" || FULL_REFRESH_DURATION_MS=1400
+  is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=40
+  case "$DEBUG_LOG" in 0|1) ;; *) DEBUG_LOG=0 ;; esac
+  is_uint "$LOG_MAX_BYTES" || LOG_MAX_BYTES=524288
   [ "$TIME_SYNC_TIMEOUT" -lt 10 ] && TIME_SYNC_TIMEOUT=10
   [ "$TIME_SYNC_TIMEOUT" -gt 180 ] && TIME_SYNC_TIMEOUT=180
   [ "$IDLE_SUSPEND_SECONDS" -lt 60 ] && IDLE_SUSPEND_SECONDS=60
@@ -89,15 +146,20 @@ load_settings() {
   [ "$PARTIAL_REFRESH_DURATION_MS" -gt 5000 ] && PARTIAL_REFRESH_DURATION_MS=5000
   [ "$FULL_REFRESH_DURATION_MS" -lt 100 ] && FULL_REFRESH_DURATION_MS=100
   [ "$FULL_REFRESH_DURATION_MS" -gt 5000 ] && FULL_REFRESH_DURATION_MS=5000
+  [ "$BATTERY_REFRESH_SETTLE_SECONDS" -lt 5 ] && BATTERY_REFRESH_SETTLE_SECONDS=5
+  [ "$BATTERY_REFRESH_SETTLE_SECONDS" -gt 50 ] && BATTERY_REFRESH_SETTLE_SECONDS=50
+  [ "$LOG_MAX_BYTES" -lt 65536 ] && LOG_MAX_BYTES=65536
+  [ "$LOG_MAX_BYTES" -gt 4194304 ] && LOG_MAX_BYTES=4194304
   [ -z "$TIMEZONE" ] && TIMEZONE=CST-8
   case "$NTP_SERVERS" in
     ''|*[!A-Za-z0-9._\ -]*) NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com" ;;
   esac
   export TZ="$TIMEZONE"
+  [ "$SETTINGS_MIGRATED" = "1" ] && save_settings
 }
-
 save_settings() {
   {
+    echo "SETTINGS_VERSION=$CURRENT_SETTINGS_VERSION"
     echo "ORIENTATION=$ORIENTATION"
     echo "HOUR_MODE=$HOUR_MODE"
     echo "THEME=$THEME"
@@ -108,10 +170,12 @@ save_settings() {
     echo "RTC_WAKE_LEAD_SECONDS=$RTC_WAKE_LEAD_SECONDS"
     echo "PARTIAL_REFRESH_DURATION_MS=$PARTIAL_REFRESH_DURATION_MS"
     echo "FULL_REFRESH_DURATION_MS=$FULL_REFRESH_DURATION_MS"
+    echo "BATTERY_REFRESH_SETTLE_SECONDS=$BATTERY_REFRESH_SETTLE_SECONDS"
+    echo "DEBUG_LOG=$DEBUG_LOG"
+    echo "LOG_MAX_BYTES=$LOG_MAX_BYTES"
   } > "$SETTINGS_FILE.tmp"
   mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
 }
-
 next_render_in_progress() {
   [ -n "$NEXT_RENDER_PID" ] && kill -0 "$NEXT_RENDER_PID" 2>/dev/null
 }
@@ -125,15 +189,130 @@ cancel_next_frame_render() {
   fi
   NEXT_RENDER_PID=""
   NEXT_FRAME_READY=0
-  rm -f "$NEXT_RENDER_PID_FILE" "$NEXT_RENDER_WORK" "$NEXT_FRAME" "$NEXT_FRAME_META"
+  NEXT_FRAME_KIND=""
+  NEXT_FRAME_CHANGED_DIGITS=0
+  rm -f "$NEXT_RENDER_PID_FILE" "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" \
+    "$NEXT_FRAME" "$NEXT_FRAME_META"
+}
+
+stop_render_server() {
+  # Close the request pipe before stopping the server. File descriptor 8 is
+  # reserved for the persistent renderer for the lifetime of this process.
+  exec 8>&- 2>/dev/null
+  if [ -n "$RENDER_SERVER_PID" ]; then
+    if kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
+      kill "$RENDER_SERVER_PID" 2>/dev/null
+    fi
+    wait "$RENDER_SERVER_PID" 2>/dev/null
+  fi
+  RENDER_SERVER_PID=""
+  RENDER_SERVER_READY=0
+  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO"
+}
+
+create_render_request_fifo() {
+  FIFO_CREATE_METHOD=""
+  rm -f "$RENDER_REQUEST_FIFO"
+
+  if command -v mkfifo >/dev/null 2>&1 && \
+     mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+    FIFO_CREATE_METHOD=mkfifo
+  else
+    rm -f "$RENDER_REQUEST_FIFO"
+    if command -v busybox >/dev/null 2>&1 && \
+       busybox mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+      FIFO_CREATE_METHOD=busybox-mkfifo
+    else
+      rm -f "$RENDER_REQUEST_FIFO"
+      if [ -x /bin/busybox ] && \
+         /bin/busybox mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+        FIFO_CREATE_METHOD=/bin/busybox-mkfifo
+      else
+        rm -f "$RENDER_REQUEST_FIFO"
+        if command -v mknod >/dev/null 2>&1 && \
+           mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+          FIFO_CREATE_METHOD=mknod
+        else
+          rm -f "$RENDER_REQUEST_FIFO"
+          if command -v busybox >/dev/null 2>&1 && \
+             busybox mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+            FIFO_CREATE_METHOD=busybox-mknod
+          elif [ -x /bin/busybox ] && \
+               /bin/busybox mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+            FIFO_CREATE_METHOD=/bin/busybox-mknod
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  if [ -z "$FIFO_CREATE_METHOD" ] || [ ! -p "$RENDER_REQUEST_FIFO" ]; then
+    rm -f "$RENDER_REQUEST_FIFO"
+    return 1
+  fi
+  log_message "persistent renderer pipe ready: method=$FIFO_CREATE_METHOD"
+  return 0
+}
+
+ping_render_server() {
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  PING_STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  rm -f "$PING_STATUS_PATH" "$PING_STATUS_PATH.tmp"
+  if ! (printf 'PING\t%s\n' "$PING_STATUS_PATH" >&8) 2>/dev/null; then
+    return 1
+  fi
+  if wait_renderer_reply "$PING_STATUS_PATH"; then
+    if [ "$SERVER_REPLY" = "OK PONG" ]; then
+      return 0
+    fi
+    log_message "persistent renderer handshake unexpected: ${SERVER_REPLY:-empty}"
+  fi
+  return 1
+}
+
+start_render_server() {
+  RENDER_SERVER_READY=0
+  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO"
+  if ! create_render_request_fifo; then
+    log_message "persistent renderer unavailable: all FIFO creation methods failed"
+    return 1
+  fi
+
+  (
+    cd /mnt/us/koreader || exit 1
+    exec ./luajit "$SRC_DIR/render_server.lua" < "$RENDER_REQUEST_FIFO"
+  ) >> "$LOG_FILE" 2>&1 &
+  RENDER_SERVER_PID=$!
+  echo "$RENDER_SERVER_PID" > "$RENDER_SERVER_PID_FILE"
+
+  # Opening the writer unblocks the server's FIFO reader and keeps stdin open
+  # between requests, allowing LuaJIT and its native libraries to stay loaded.
+  if ! exec 8>"$RENDER_REQUEST_FIFO"; then
+    log_message "persistent renderer unavailable: could not open request pipe"
+    stop_render_server
+    return 1
+  fi
+  if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
+    log_message "persistent renderer exited during startup"
+    stop_render_server
+    return 1
+  fi
+  RENDER_SERVER_READY=1
+  if ! ping_render_server; then
+    log_message "persistent renderer unavailable: startup handshake failed"
+    stop_render_server
+    return 1
+  fi
+  log_message "persistent renderer started: pid=$RENDER_SERVER_PID handshake=pong"
+  return 0
 }
 
 cleanup() {
   [ "$CLEANED" = "1" ] && return
   CLEANED=1
-
   [ -n "$KEY_PID" ] && kill "$KEY_PID" 2>/dev/null
   cancel_next_frame_render
+  stop_render_server
   if [ -n "$SYNC_PID" ]; then
     if kill -0 "$SYNC_PID" 2>/dev/null; then
       kill "$SYNC_PID" 2>/dev/null
@@ -148,7 +327,6 @@ cleanup() {
   case "$ORIGINAL_WIFI_STATE" in
     0|1) wifi_set_enabled "$ORIGINAL_WIFI_STATE" ;;
   esac
-
   if [ "$UI_STOPPED" = "1" ]; then
     /usr/bin/lipc-set-prop -- com.lab126.powerd preventScreenSaver 0 >/dev/null 2>&1
     /etc/init.d/framework start >/dev/null 2>&1
@@ -158,10 +336,11 @@ cleanup() {
 
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
     "$PID_FILE" "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
-    "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$CURRENT_FRAME" "$NEXT_FRAME" \
-    "$NEXT_RENDER_WORK" "$NEXT_FRAME_META"
+    "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
+    "$RENDER_REQUEST_FIFO" "$CURRENT_FRAME" "$NEXT_FRAME" \
+    "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
+    "$PARTIAL_DISABLED_FILE"
 }
-
 get_battery_level() {
   LEVEL=$(gasgauge-info -c 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
   case "$LEVEL" in ''|*[!0-9]*) LEVEL=0 ;; esac
@@ -178,7 +357,6 @@ next_minute_epoch() {
   EPOCH_VALUE="$1"
   echo $(((EPOCH_VALUE / 60 + 1) * 60))
 }
-
 read_pmic_epoch() {
   [ -r "$RTC_PMIC_EPOCH_PATH" ] || return 1
   PMIC_HEX=$(cat "$RTC_PMIC_EPOCH_PATH" 2>/dev/null)
@@ -189,18 +367,34 @@ read_pmic_epoch() {
 }
 
 scheduler_now() {
-  if [ "$CLOCK_SOURCE" = "pmic" ]; then
-    read_pmic_epoch
-  else
-    date +%s
-  fi
+  # rtc_pmic_epoch_time is not a continuously advancing clock on K4NT.
+  # Use wall-clock epoch time for all scheduling and deadline decisions.
+  date +%s
 }
 
 monotonic_stamp() {
   UPTIME_VALUE=$(cat /proc/uptime 2>/dev/null)
   echo "${UPTIME_VALUE%% *}"
 }
-
+monotonic_centiseconds() {
+  UPTIME_VALUE=$(cat /proc/uptime 2>/dev/null)
+  UPTIME_VALUE=${UPTIME_VALUE%% *}
+  case "$UPTIME_VALUE" in
+    *.*) ;;
+    *) return 1 ;;
+  esac
+  UPTIME_SECONDS=${UPTIME_VALUE%%.*}
+  UPTIME_FRACTION=${UPTIME_VALUE#*.}
+  is_uint "$UPTIME_SECONDS" || return 1
+  UPTIME_FRACTION=$(printf '%.2s' "${UPTIME_FRACTION}00")
+  is_uint "$UPTIME_FRACTION" || return 1
+  echo $((UPTIME_SECONDS * 100 + 1$UPTIME_FRACTION - 100))
+}
+format_monotonic_centiseconds() {
+  FORMAT_CS="$1"
+  is_uint "$FORMAT_CS" || { echo unknown; return 1; }
+  printf '%s.%02d' "$((FORMAT_CS / 100))" "$((FORMAT_CS % 100))"
+}
 sleep_ms() {
   DELAY_MS="$1"
   [ "$DELAY_MS" -gt 0 ] || return 0
@@ -212,53 +406,236 @@ sleep_ms() {
   fi
 }
 
-refresh_duration_for_epoch() {
+sleep_until_monotonic_centiseconds() {
+  SLEEP_TARGET_CS="$1"
+  is_uint "$SLEEP_TARGET_CS" || return 1
+  while :; do
+    SLEEP_NOW_CS=$(monotonic_centiseconds) || return 1
+    SLEEP_REMAINING_CS=$((SLEEP_TARGET_CS - SLEEP_NOW_CS))
+    [ "$SLEEP_REMAINING_CS" -gt 0 ] || return 0
+    if [ "$SLEEP_REMAINING_CS" -gt 10 ]; then
+      sleep_ms $(((SLEEP_REMAINING_CS - 5) * 10))
+    else
+      sleep_ms $((SLEEP_REMAINING_CS * 10))
+    fi
+  done
+}
+select_refresh_profile() {
   REFRESH_EPOCH="$1"
   REFRESH_MINUTE=$(((REFRESH_EPOCH / 60) % 60))
   if [ "$REFRESH_MINUTE" -eq 0 ]; then
-    echo "$FULL_REFRESH_DURATION_MS"
+    REFRESH_PROFILE_KIND=full
+    REFRESH_DURATION_MS="$FULL_REFRESH_DURATION_MS"
+  elif [ "$NEXT_FRAME_KIND" = "partial" ] && [ "$NEXT_FRAME_CHANGED_DIGITS" = "1" ]; then
+    REFRESH_PROFILE_KIND=digit1
+    REFRESH_DURATION_MS="$PARTIAL_REFRESH_DURATION_MS"
+  elif [ "$NEXT_FRAME_KIND" = "partial" ]; then
+    REFRESH_PROFILE_KIND=digit2
+    REFRESH_DURATION_MS="$PARTIAL_REFRESH_DURATION_MS"
   else
-    echo "$PARTIAL_REFRESH_DURATION_MS"
+    REFRESH_PROFILE_KIND=full
+    REFRESH_DURATION_MS="$FULL_REFRESH_DURATION_MS"
   fi
 }
-
+prepare_refresh_release() {
+  RELEASE_NOW_CLOCK="$1"
+  is_uint "$RELEASE_NOW_CLOCK" || return 1
+  if [ "$REFRESH_SCHEDULE_EPOCH" != "$NEXT_FRAME_EPOCH" ]; then
+    select_refresh_profile "$NEXT_FRAME_EPOCH"
+    REFRESH_SCHEDULE_EPOCH="$NEXT_FRAME_EPOCH"
+    REFRESH_BOUNDARY_UPTIME_CS=""
+    REFRESH_PLANNED_START_UPTIME_CS=""
+  fi
+  if ! is_uint "$REFRESH_BOUNDARY_UPTIME_CS"; then
+    RELEASE_SAMPLE_CS=$(monotonic_centiseconds) || return 1
+    if [ "$RELEASE_NOW_CLOCK" -lt "$NEXT_DISPLAY_CLOCK" ]; then
+      REFRESH_BOUNDARY_UPTIME_CS=$((RELEASE_SAMPLE_CS + (NEXT_DISPLAY_CLOCK - RELEASE_NOW_CLOCK) * 100))
+    else
+      REFRESH_BOUNDARY_UPTIME_CS=$((RELEASE_SAMPLE_CS - (RELEASE_NOW_CLOCK - NEXT_DISPLAY_CLOCK) * 100))
+    fi
+    REFRESH_HALF_CS=$(((REFRESH_DURATION_MS + 19) / 20))
+    REFRESH_PLANNED_START_UPTIME_CS=$((REFRESH_BOUNDARY_UPTIME_CS - REFRESH_HALF_CS))
+    log_debug "refresh schedule: target=$NEXT_FRAME_EPOCH profile=$REFRESH_PROFILE_KIND estimate_ms=$REFRESH_DURATION_MS start_uptime=$(format_monotonic_centiseconds "$REFRESH_PLANNED_START_UPTIME_CS") boundary_uptime=$(format_monotonic_centiseconds "$REFRESH_BOUNDARY_UPTIME_CS")"
+  fi
+  sleep_until_monotonic_centiseconds "$REFRESH_PLANNED_START_UPTIME_CS"
+}
 initialize_virtual_clock() {
   SYSTEM_NOW=$(date +%s)
   CURRENT_FRAME_EPOCH=$(minute_epoch "$SYSTEM_NOW")
   NEXT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + 60))
-
-  PMIC_NOW=$(read_pmic_epoch 2>/dev/null)
-  if is_uint "$PMIC_NOW" && [ "$PMIC_NOW" -gt 0 ]; then
-    CLOCK_SOURCE=pmic
-    SCHEDULER_NOW="$PMIC_NOW"
-  else
-    CLOCK_SOURCE=system
-    SCHEDULER_NOW="$SYSTEM_NOW"
-  fi
-
-  SECONDS_TO_NEXT=$((NEXT_FRAME_EPOCH - SYSTEM_NOW))
-  [ "$SECONDS_TO_NEXT" -lt 1 ] && SECONDS_TO_NEXT=1
-  NEXT_DISPLAY_CLOCK=$((SCHEDULER_NOW + SECONDS_TO_NEXT))
-  log_message "virtual clock anchored: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=$CLOCK_SOURCE clock_now=$SCHEDULER_NOW display_clock=$NEXT_DISPLAY_CLOCK"
+  CLOCK_SOURCE=system
+  NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
+  log_message "virtual clock anchored: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=system display_clock=$NEXT_DISPLAY_CLOCK"
 }
-
 advance_virtual_clock() {
   CURRENT_FRAME_EPOCH="$NEXT_FRAME_EPOCH"
   NEXT_FRAME_EPOCH=$((NEXT_FRAME_EPOCH + 60))
   NEXT_DISPLAY_CLOCK=$((NEXT_DISPLAY_CLOCK + 60))
+}
+run_one_shot_renderer() {
+  ONE_SHOT_OUTPUT="$1"
+  ONE_SHOT_ORIENTATION="$2"
+  ONE_SHOT_THEME="$3"
+  ONE_SHOT_EPOCH="$4"
+  ONE_SHOT_BATTERY="$5"
+  ONE_SHOT_HELP="$6"
+  ONE_SHOT_HOUR_MODE="$7"
+  (
+    cd /mnt/us/koreader || exit 1
+    ./luajit "$SRC_DIR/render.lua" "$ONE_SHOT_OUTPUT" \
+      "$ONE_SHOT_ORIENTATION" "$ONE_SHOT_THEME" "$ONE_SHOT_EPOCH" \
+      "$ONE_SHOT_BATTERY" "$ONE_SHOT_HELP" "$ONE_SHOT_HOUR_MODE"
+  ) >> "$LOG_FILE" 2>&1
+}
+
+wait_renderer_reply() {
+  STATUS_PATH="$1"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  SERVER_WAIT_DEADLINE=$(($(date +%s) + 30))
+  while [ ! -f "$STATUS_PATH" ]; do
+    if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
+      return 1
+    fi
+    SERVER_WAIT_NOW=$(date +%s)
+    if [ "$SERVER_WAIT_NOW" -ge "$SERVER_WAIT_DEADLINE" ]; then
+      log_message "persistent renderer timed out; stopping server before fallback"
+      kill "$RENDER_SERVER_PID" 2>/dev/null
+      return 1
+    fi
+    pause_briefly
+  done
+  SERVER_REPLY=$(cat "$STATUS_PATH" 2>/dev/null)
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+  case "$SERVER_REPLY" in
+    OK|OK\ *) return 0 ;;
+    ERROR*) log_message "persistent renderer error: ${SERVER_REPLY#ERROR }" ;;
+  esac
+  return 1
+}
+
+run_persistent_renderer() {
+  STATUS_PATH="$1"
+  SERVER_OUTPUT="$2"
+  SERVER_ORIENTATION="$3"
+  SERVER_THEME="$4"
+  SERVER_EPOCH="$5"
+  SERVER_BATTERY="$6"
+  SERVER_HELP="$7"
+  SERVER_HOUR_MODE="$8"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+
+  # Every request is below PIPE_BUF, so background preparation and foreground
+  # display requests cannot be interleaved in the FIFO.
+  if ! (printf 'RENDER\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$STATUS_PATH" "$SERVER_OUTPUT" "$SERVER_ORIENTATION" "$SERVER_THEME" \
+      "$SERVER_EPOCH" "$SERVER_BATTERY" "$SERVER_HELP" "$SERVER_HOUR_MODE" >&8) 2>/dev/null; then
+    return 1
+  fi
+  wait_renderer_reply "$STATUS_PATH"
+}
+
+parse_partial_detail() {
+  set -- $1
+  [ "$5" = "DIGITS" ] || return 1
+  is_uint "$1" && is_uint "$2" && is_uint "$3" && is_uint "$4" && \
+    is_uint "$6" || return 1
+  PARTIAL_X="$1"
+  PARTIAL_Y="$2"
+  PARTIAL_WIDTH="$3"
+  PARTIAL_HEIGHT="$4"
+  PARTIAL_CHANGED_COUNT="$6"
+  PARTIAL_START_CS=""
+  PARTIAL_END_CS=""
+  if [ "${7:-}" = "START_CS" ] && is_uint "${8:-}" && \
+     [ "${9:-}" = "END_CS" ] && is_uint "${10:-}"; then
+    PARTIAL_START_CS="$8"
+    PARTIAL_END_CS="${10}"
+  fi
+  return 0
+}
+
+prepare_partial_frame() {
+  STATUS_PATH="$1"
+  PARTIAL_ORIENTATION="$2"
+  PARTIAL_THEME="$3"
+  PARTIAL_CURRENT_EPOCH="$4"
+  PARTIAL_EPOCH="$5"
+  PARTIAL_HOUR_MODE="$6"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+  if ! (printf 'PREPARE\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$STATUS_PATH" "$PARTIAL_ORIENTATION" "$PARTIAL_THEME" \
+      "$PARTIAL_CURRENT_EPOCH" "$PARTIAL_EPOCH" "$PARTIAL_HOUR_MODE" >&8) 2>/dev/null; then
+    return 1
+  fi
+  if wait_renderer_reply "$STATUS_PATH"; then
+    PARTIAL_DETAIL=${SERVER_REPLY#OK PARTIAL }
+    parse_partial_detail "$PARTIAL_DETAIL" || PARTIAL_CHANGED_COUNT=1
+    log_debug "partial frame prepared: target=$PARTIAL_EPOCH region=$PARTIAL_DETAIL"
+    return 0
+  fi
+  return 1
+}
+
+display_partial_frame() {
+  DISPLAY_EPOCH="$1"
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+  if ! (printf 'DISPLAY\t%s\t%s\n' "$STATUS_PATH" "$DISPLAY_EPOCH" >&8) 2>/dev/null; then
+    return 1
+  fi
+  if ! wait_renderer_reply "$STATUS_PATH"; then
+    return 1
+  fi
+  PARTIAL_DETAIL=${SERVER_REPLY#OK PARTIAL }
+  parse_partial_detail "$PARTIAL_DETAIL" || return 1
+  DISPLAY_CHANGED_DIGITS="$PARTIAL_CHANGED_COUNT"
+  DISPLAY_START_UPTIME_CS="$PARTIAL_START_CS"
+  DISPLAY_END_UPTIME_CS="$PARTIAL_END_CS"
+  DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
+  if is_uint "$DISPLAY_START_UPTIME_CS" && is_uint "$DISPLAY_END_UPTIME_CS" && \
+     [ "$DISPLAY_END_UPTIME_CS" -ge "$DISPLAY_START_UPTIME_CS" ]; then
+    DISPLAY_DURATION_MS=$(((DISPLAY_END_UPTIME_CS - DISPLAY_START_UPTIME_CS) * 10))
+    if [ "$REFRESH_SCHEDULE_EPOCH" = "$DISPLAY_EPOCH" ] && is_uint "$REFRESH_BOUNDARY_UPTIME_CS"; then
+      DISPLAY_START_OFFSET_MS=$(((DISPLAY_START_UPTIME_CS - REFRESH_BOUNDARY_UPTIME_CS) * 10))
+      DISPLAY_END_OFFSET_MS=$(((DISPLAY_END_UPTIME_CS - REFRESH_BOUNDARY_UPTIME_CS) * 10))
+      log_message "minute: target=$DISPLAY_EPOCH kind=digits region=$PARTIAL_X $PARTIAL_Y $PARTIAL_WIDTH $PARTIAL_HEIGHT DIGITS $DISPLAY_CHANGED_DIGITS refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=$(format_monotonic_centiseconds "$REFRESH_BOUNDARY_UPTIME_CS") refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") start_offset_ms=$DISPLAY_START_OFFSET_MS end_offset_ms=$DISPLAY_END_OFFSET_MS duration_ms=$DISPLAY_DURATION_MS fixed_ms=$PARTIAL_REFRESH_DURATION_MS rtc_late=${RTC_RESUME_LATENESS_SECONDS:-unknown}"
+    else
+      log_message "minute: target=$DISPLAY_EPOCH kind=digits region=$PARTIAL_X $PARTIAL_Y $PARTIAL_WIDTH $PARTIAL_HEIGHT DIGITS $DISPLAY_CHANGED_DIGITS refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=unknown refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") duration_ms=$DISPLAY_DURATION_MS fixed_ms=$PARTIAL_REFRESH_DURATION_MS rtc_late=${RTC_RESUME_LATENESS_SECONDS:-unknown}"
+    fi
+  else
+    log_message "minute: target=$DISPLAY_EPOCH kind=digits region=$PARTIAL_DETAIL timing=unavailable display_clock=${DISPLAY_END_CLOCK:-unknown} rtc_late=${RTC_RESUME_LATENESS_SECONDS:-unknown}"
+  fi
+  return 0
+}
+
+run_renderer() {
+  STATUS_PATH="$1"
+  shift
+  if run_persistent_renderer "$STATUS_PATH" "$@"; then
+    return 0
+  fi
+  log_message "persistent renderer request failed; using one-shot fallback"
+  run_one_shot_renderer "$@"
 }
 
 render_frame() {
   TARGET_EPOCH="$1"
   OUTPUT_PATH="$2"
   rm -f "$OUTPUT_PATH"
-  log_message "rendering epoch $TARGET_EPOCH to $OUTPUT_PATH"
-  (
-    cd /mnt/us/koreader || exit 1
-    ./luajit "$SRC_DIR/render.lua" "$OUTPUT_PATH" \
-      "$ORIENTATION" "$THEME" "$TARGET_EPOCH" "$BATTERY_LEVEL" \
-      "$HELP_VISIBLE" "$HOUR_MODE"
-  ) >> "$LOG_FILE" 2>&1
+  log_debug "rendering epoch $TARGET_EPOCH to $OUTPUT_PATH"
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  RENDER_STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  run_renderer "$RENDER_STATUS_PATH" "$OUTPUT_PATH" \
+    "$ORIENTATION" "$THEME" "$TARGET_EPOCH" "$BATTERY_LEVEL" \
+    "$HELP_VISIBLE" "$HOUR_MODE"
   RENDER_STATUS=$?
   if [ "$RENDER_STATUS" -ne 0 ]; then
     log_message "KOReader renderer failed with status $RENDER_STATUS"
@@ -270,14 +647,12 @@ render_frame() {
   fi
   return 0
 }
-
 render_current_frame() {
   BATTERY_LEVEL=$(get_battery_level)
   CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
-  log_message "current-frame sample: target=$CURRENT_FRAME_EPOCH battery=$CURRENT_FRAME_BATTERY"
+  log_debug "current-frame sample: target=$CURRENT_FRAME_EPOCH battery=$CURRENT_FRAME_BATTERY"
   render_frame "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME"
 }
-
 full_refresh() {
   FRAME_PATH="$1"
   log_message "full refresh: $FRAME_PATH"
@@ -286,7 +661,6 @@ full_refresh() {
   eips -c >> "$LOG_FILE" 2>&1
   eips -g "$FRAME_PATH" >> "$LOG_FILE" 2>&1
 }
-
 display_frame() {
   FRAME_PATH="$1"
   FORCE_FULL="$2"
@@ -295,7 +669,8 @@ display_frame() {
   DISPLAY_MINUTE=$(((DISPLAY_EPOCH / 60) % 60))
   DISPLAY_START_CLOCK=$(scheduler_now 2>/dev/null)
   DISPLAY_START_UPTIME=$(monotonic_stamp)
-  log_message "display start: target=$DISPLAY_EPOCH battery=$DISPLAY_BATTERY source=$CLOCK_SOURCE clock=${DISPLAY_START_CLOCK:-unknown} uptime=${DISPLAY_START_UPTIME:-unknown}"
+  DISPLAY_START_UPTIME_CS=$(monotonic_centiseconds 2>/dev/null)
+  log_debug "display start: target=$DISPLAY_EPOCH battery=$DISPLAY_BATTERY source=$CLOCK_SOURCE clock=${DISPLAY_START_CLOCK:-unknown} uptime=${DISPLAY_START_UPTIME:-unknown}"
   if [ "$FORCE_FULL" = "1" ] || [ "$DISPLAY_MINUTE" -eq 0 ]; then
     full_refresh "$FRAME_PATH"
   else
@@ -303,30 +678,76 @@ display_frame() {
   fi
   DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
   DISPLAY_END_UPTIME=$(monotonic_stamp)
-  log_message "display end: target=$DISPLAY_EPOCH clock=${DISPLAY_END_CLOCK:-unknown} uptime=${DISPLAY_END_UPTIME:-unknown}"
+  DISPLAY_END_UPTIME_CS=$(monotonic_centiseconds 2>/dev/null)
+  if is_uint "$DISPLAY_START_UPTIME_CS" && is_uint "$DISPLAY_END_UPTIME_CS" && \
+     [ "$DISPLAY_END_UPTIME_CS" -ge "$DISPLAY_START_UPTIME_CS" ]; then
+    DISPLAY_DURATION_MS=$(((DISPLAY_END_UPTIME_CS - DISPLAY_START_UPTIME_CS) * 10))
+    if [ "$REFRESH_SCHEDULE_EPOCH" = "$DISPLAY_EPOCH" ] && is_uint "$REFRESH_BOUNDARY_UPTIME_CS"; then
+      DISPLAY_START_OFFSET_MS=$(((DISPLAY_START_UPTIME_CS - REFRESH_BOUNDARY_UPTIME_CS) * 10))
+      DISPLAY_END_OFFSET_MS=$(((DISPLAY_END_UPTIME_CS - REFRESH_BOUNDARY_UPTIME_CS) * 10))
+      log_message "frame: target=$DISPLAY_EPOCH kind=png battery=$DISPLAY_BATTERY refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=$(format_monotonic_centiseconds "$REFRESH_BOUNDARY_UPTIME_CS") refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") start_offset_ms=$DISPLAY_START_OFFSET_MS end_offset_ms=$DISPLAY_END_OFFSET_MS duration_ms=$DISPLAY_DURATION_MS fixed_ms=$FULL_REFRESH_DURATION_MS"
+    else
+      log_message "frame: target=$DISPLAY_EPOCH kind=png battery=$DISPLAY_BATTERY refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=none refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") duration_ms=$DISPLAY_DURATION_MS fixed_ms=$FULL_REFRESH_DURATION_MS"
+    fi
+  else
+    log_message "frame: target=$DISPLAY_EPOCH kind=png battery=$DISPLAY_BATTERY clock=${DISPLAY_END_CLOCK:-unknown} uptime=${DISPLAY_END_UPTIME:-unknown} timing=unavailable"
+  fi
 }
-
 start_next_frame_render() {
+  BATTERY_OVERRIDE="$1"
   [ -n "$SYNC_PID" ] && return 1
   next_render_in_progress && return 1
-
-  BATTERY_LEVEL=$(get_battery_level)
+  if is_uint "$BATTERY_OVERRIDE"; then
+    BATTERY_LEVEL="$BATTERY_OVERRIDE"
+  else
+    # The K4 gas gauge is deliberately sampled after the hourly refresh. Keep
+    # that displayed value between samples so ordinary minutes remain a pure
+    # changed-digit update.
+    BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
+    is_uint "$BATTERY_LEVEL" || BATTERY_LEVEL=$(get_battery_level)
+  fi
   NEXT_FRAME_RENDER_EPOCH="$NEXT_FRAME_EPOCH"
   NEXT_FRAME_BATTERY="$BATTERY_LEVEL"
   NEXT_FRAME_READY=0
-  rm -f "$NEXT_FRAME" "$NEXT_RENDER_WORK" "$NEXT_RENDER_PID_FILE" "$NEXT_FRAME_META"
-  log_message "pre-rendering next minute: target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
+  NEXT_FRAME_KIND=""
+  NEXT_FRAME_CHANGED_DIGITS=0
+  rm -f "$NEXT_FRAME" "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" \
+    "$NEXT_RENDER_PID_FILE" "$NEXT_FRAME_META"
+  log_debug "pre-rendering next minute: target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  NEXT_RENDER_STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  NEXT_RENDER_MINUTE=$(((NEXT_FRAME_RENDER_EPOCH / 60) % 60))
+  NEXT_RENDER_STEP=$((NEXT_FRAME_RENDER_EPOCH - CURRENT_FRAME_EPOCH))
+  PARTIAL_ELIGIBLE=0
+  if [ "$HELP_VISIBLE" = "0" ] && [ "$NEXT_RENDER_MINUTE" -ne 0 ] && \
+     [ "$NEXT_RENDER_STEP" -eq 60 ] && \
+     [ "$NEXT_FRAME_BATTERY" = "$CURRENT_FRAME_BATTERY" ] && \
+     [ "$RENDER_SERVER_READY" = "1" ] && [ ! -f "$PARTIAL_DISABLED_FILE" ]; then
+    PARTIAL_ELIGIBLE=1
+  fi
   (
-    cd /mnt/us/koreader || exit 1
-    exec ./luajit "$SRC_DIR/render.lua" "$NEXT_RENDER_WORK" \
-      "$ORIENTATION" "$THEME" "$NEXT_FRAME_RENDER_EPOCH" "$NEXT_FRAME_BATTERY" \
-      "$HELP_VISIBLE" "$HOUR_MODE"
-  ) >> "$LOG_FILE" 2>&1 &
+    if [ "$PARTIAL_ELIGIBLE" = "1" ] && \
+       prepare_partial_frame "$NEXT_RENDER_STATUS_PATH" "$ORIENTATION" "$THEME" \
+         "$CURRENT_FRAME_EPOCH" "$NEXT_FRAME_RENDER_EPOCH" "$HOUR_MODE"; then
+      echo "partial $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY ${PARTIAL_CHANGED_COUNT:-1}" > "$NEXT_RENDER_RESULT"
+    else
+      if [ "$PARTIAL_ELIGIBLE" = "1" ]; then
+        log_message "partial preparation unavailable; pre-rendering full PNG fallback"
+        touch "$PARTIAL_DISABLED_FILE"
+      fi
+      if run_renderer "$NEXT_RENDER_STATUS_PATH" "$NEXT_RENDER_WORK" \
+        "$ORIENTATION" "$THEME" "$NEXT_FRAME_RENDER_EPOCH" "$NEXT_FRAME_BATTERY" \
+        "$HELP_VISIBLE" "$HOUR_MODE" && [ -s "$NEXT_RENDER_WORK" ]; then
+        echo "png $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY 0" > "$NEXT_RENDER_RESULT"
+      else
+        false
+      fi
+    fi
+  ) &
   NEXT_RENDER_PID=$!
   echo "$NEXT_RENDER_PID" > "$NEXT_RENDER_PID_FILE"
   return 0
 }
-
 next_render_finished() {
   [ -n "$NEXT_RENDER_PID" ] && ! kill -0 "$NEXT_RENDER_PID" 2>/dev/null
 }
@@ -337,32 +758,60 @@ finish_next_frame_render() {
   RENDER_STATUS=$?
   NEXT_RENDER_PID=""
   rm -f "$NEXT_RENDER_PID_FILE"
-
-  if [ "$RENDER_STATUS" -eq 0 ] && [ -s "$NEXT_RENDER_WORK" ]; then
-    mv "$NEXT_RENDER_WORK" "$NEXT_FRAME"
-    echo "$NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY" > "$NEXT_FRAME_META"
-    NEXT_FRAME_READY=1
-    log_message "next-minute frame ready: target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
-    return 0
+  RESULT_KIND=""
+  RESULT_EPOCH=""
+  RESULT_BATTERY=""
+  RESULT_CHANGED_DIGITS=0
+  [ -f "$NEXT_RENDER_RESULT" ] && \
+    read RESULT_KIND RESULT_EPOCH RESULT_BATTERY RESULT_CHANGED_DIGITS < "$NEXT_RENDER_RESULT"
+  rm -f "$NEXT_RENDER_RESULT"
+  if [ "$RENDER_STATUS" -eq 0 ] && [ "$RESULT_EPOCH" = "$NEXT_FRAME_RENDER_EPOCH" ] && \
+     [ "$RESULT_BATTERY" = "$NEXT_FRAME_BATTERY" ]; then
+    case "$RESULT_KIND" in
+      partial)
+        is_uint "$RESULT_CHANGED_DIGITS" || RESULT_CHANGED_DIGITS=1
+        NEXT_FRAME_KIND=partial
+        NEXT_FRAME_CHANGED_DIGITS="$RESULT_CHANGED_DIGITS"
+        ;;
+      png)
+        if [ ! -s "$NEXT_RENDER_WORK" ]; then
+          RESULT_KIND=""
+        else
+          mv "$NEXT_RENDER_WORK" "$NEXT_FRAME"
+          NEXT_FRAME_KIND=png
+          NEXT_FRAME_CHANGED_DIGITS=0
+        fi
+        ;;
+      *) RESULT_KIND="" ;;
+    esac
+    if [ -n "$RESULT_KIND" ]; then
+      echo "$NEXT_FRAME_KIND $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY $NEXT_FRAME_CHANGED_DIGITS" > "$NEXT_FRAME_META"
+      NEXT_FRAME_READY=1
+      log_debug "next-minute frame ready: kind=$NEXT_FRAME_KIND target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
+      return 0
+    fi
   fi
 
-  rm -f "$NEXT_RENDER_WORK"
+  rm -f "$NEXT_RENDER_WORK" "$NEXT_FRAME"
   NEXT_FRAME_READY=0
+  NEXT_FRAME_KIND=""
+  NEXT_FRAME_CHANGED_DIGITS=0
   log_message "next-minute renderer failed with status $RENDER_STATUS"
   return 1
 }
-
 prepare_next_minute() {
+  BATTERY_OVERRIDE="$1"
   NEXT_FRAME_READY=0
-  rm -f "$NEXT_FRAME" "$NEXT_FRAME_META"
-  [ -n "$SYNC_PID" ] || start_next_frame_render
+  NEXT_FRAME_KIND=""
+  NEXT_FRAME_CHANGED_DIGITS=0
+  rm -f "$NEXT_FRAME" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META"
+  [ -n "$SYNC_PID" ] || start_next_frame_render "$BATTERY_OVERRIDE"
 }
 
 publish_key_event() {
   echo "$1" > "$KEY_EVENT_FILE.tmp"
   mv "$KEY_EVENT_FILE.tmp" "$KEY_EVENT_FILE"
 }
-
 watch_keys() {
   while [ ! -f "$EXIT_FILE" ]; do
     KEY=$(waitforkey)
@@ -379,7 +828,6 @@ watch_keys() {
     esac
   done
 }
-
 pause_briefly() {
   if command -v usleep >/dev/null 2>&1; then
     usleep 100000
@@ -388,43 +836,73 @@ pause_briefly() {
   fi
 }
 
+refresh_battery_sample_after_hourly_full_refresh() {
+  # CURRENT_FRAME_EPOCH is the frame just displayed. display_frame() performs
+  # a full refresh whenever its minute field is 00, so this condition binds
+  # the gas-gauge awake window to that same hourly refresh.
+  DISPLAYED_MINUTE=$(((CURRENT_FRAME_EPOCH / 60) % 60))
+  [ "$DISPLAYED_MINUTE" -eq 0 ] || return 1
+
+  REFRESH_AWAKE_START=$(scheduler_now 2>/dev/null)
+  is_uint "$REFRESH_AWAKE_START" || REFRESH_AWAKE_START=$(date +%s)
+  REFRESH_AWAKE_DEADLINE=$((REFRESH_AWAKE_START + BATTERY_REFRESH_SETTLE_SECONDS))
+  log_debug "battery refresh window: target=$NEXT_FRAME_EPOCH settle=${BATTERY_REFRESH_SETTLE_SECONDS}s old=$CURRENT_FRAME_BATTERY"
+
+  while [ ! -f "$EXIT_FILE" ]; do
+    if [ -f "$KEY_EVENT_FILE" ]; then
+      log_message "battery refresh window interrupted by key event"
+      return 1
+    fi
+    REFRESH_AWAKE_NOW=$(scheduler_now 2>/dev/null)
+    is_uint "$REFRESH_AWAKE_NOW" || REFRESH_AWAKE_NOW=$(date +%s)
+    [ "$REFRESH_AWAKE_NOW" -ge "$REFRESH_AWAKE_DEADLINE" ] && break
+    sleep 1
+  done
+
+  [ -f "$EXIT_FILE" ] && return 1
+  FRESH_BATTERY_LEVEL=$(get_battery_level)
+  log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL awake_since=$REFRESH_AWAKE_START"
+  echo "$FRESH_BATTERY_LEVEL"
+  return 0
+}
+
 try_rtc_suspend() {
-  EXPECTED_WAKE_PMIC="$1"
-  [ "$CLOCK_SOURCE" = "pmic" ] || return 1
-  is_uint "$EXPECTED_WAKE_PMIC" || return 1
-  [ "$EXPECTED_WAKE_PMIC" -gt 0 ] || return 1
+  EXPECTED_WAKE_SYSTEM="$1"
+  is_uint "$EXPECTED_WAKE_SYSTEM" || return 1
+  [ "$EXPECTED_WAKE_SYSTEM" -gt 0 ] || return 1
   [ -r "$RTC_PATH" ] && [ -w "$RTC_PATH" ] && [ -w "$POWER_STATE_PATH" ] && \
     [ -r "$RTC_PMIC_EPOCH_PATH" ] || return 1
-
-  SUSPEND_START_PMIC=$(read_pmic_epoch) || return 1
-  SUSPEND_SECONDS=$((EXPECTED_WAKE_PMIC - SUSPEND_START_PMIC))
-  [ "$SUSPEND_SECONDS" -gt 0 ] || return 1
-
+  SUSPEND_START_SYSTEM=$(date +%s)
+  is_uint "$SUSPEND_START_SYSTEM" || return 1
+  SUSPEND_SECONDS=$((EXPECTED_WAKE_SYSTEM - SUSPEND_START_SYSTEM))
+  # Very short RTC alarms are unreliable on K4NT; stay awake instead.
+  [ "$SUSPEND_SECONDS" -ge 2 ] || return 1
   RTC_STATE=$(cat "$RTC_PATH" 2>/dev/null)
   [ "$RTC_STATE" = "0" ] || return 1
   echo -n "$SUSPEND_SECONDS" > "$RTC_PATH" 2>/dev/null || return 1
   RTC_WOKE_EARLY=0
   RTC_RESUME_LATENESS_SECONDS=0
-  log_message "RTC suspend: planned_wake_pmic=$EXPECTED_WAKE_PMIC current_pmic=$SUSPEND_START_PMIC delay=$SUSPEND_SECONDS display_clock=$NEXT_DISPLAY_CLOCK"
+  if [ "$DEBUG_LOG" = "1" ]; then
+    SUSPEND_START_PMIC=$(read_pmic_epoch 2>/dev/null)
+    log_debug "RTC suspend: planned_wake_system=$EXPECTED_WAKE_SYSTEM current_system=$SUSPEND_START_SYSTEM delay=$SUSPEND_SECONDS pmic=${SUSPEND_START_PMIC:-unknown} display_clock=$NEXT_DISPLAY_CLOCK"
+  fi
   echo mem > "$POWER_STATE_PATH" 2>> "$LOG_FILE"
   SUSPEND_STATUS=$?
-  RESUME_PMIC=$(read_pmic_epoch 2>/dev/null)
   RESUME_SYSTEM=$(date +%s)
-  if is_uint "$RESUME_PMIC" && [ "$RESUME_PMIC" -gt 0 ]; then
-    RTC_RESUME_LATENESS_SECONDS=$((RESUME_PMIC - EXPECTED_WAKE_PMIC))
-    # A value at least two seconds before the alarm indicates a different
-    # hardware source, normally the power button. One second is tolerated for
-    # the PMIC RTC's integer-second sampling boundary.
-    if [ $((RESUME_PMIC + 1)) -lt "$EXPECTED_WAKE_PMIC" ]; then
+  if is_uint "$RESUME_SYSTEM" && [ "$RESUME_SYSTEM" -gt 0 ]; then
+    RTC_RESUME_LATENESS_SECONDS=$((RESUME_SYSTEM - EXPECTED_WAKE_SYSTEM))
+    # A resume at least two seconds before the requested wake time is treated
+    # as a power-button/other hardware wake. PMIC is diagnostics only.
+    if [ $((RESUME_SYSTEM + 1)) -lt "$EXPECTED_WAKE_SYSTEM" ]; then
       RTC_WOKE_EARLY=1
     fi
-    log_message "RTC resume: planned_wake_pmic=$EXPECTED_WAKE_PMIC actual_pmic=$RESUME_PMIC lateness=$RTC_RESUME_LATENESS_SECONDS system=$RESUME_SYSTEM early=$RTC_WOKE_EARLY status=$SUSPEND_STATUS"
-  else
-    log_message "RTC resume: planned_wake_pmic=$EXPECTED_WAKE_PMIC actual_pmic=unknown system=$RESUME_SYSTEM early=unknown status=$SUSPEND_STATUS"
+  fi
+  if [ "$DEBUG_LOG" = "1" ]; then
+    RESUME_PMIC=$(read_pmic_epoch 2>/dev/null)
+    log_debug "RTC resume: planned_wake_system=$EXPECTED_WAKE_SYSTEM actual_system=$RESUME_SYSTEM lateness=$RTC_RESUME_LATENESS_SECONDS pmic=${RESUME_PMIC:-unknown} early=$RTC_WOKE_EARLY status=$SUSPEND_STATUS"
   fi
   return "$SUSPEND_STATUS"
 }
-
 sync_finished() {
   [ -f "$SYNC_RESULT_FILE" ] && return 0
   [ -n "$SYNC_PID" ] && ! kill -0 "$SYNC_PID" 2>/dev/null
@@ -446,7 +924,6 @@ wait_for_event_or_minute() {
       WAIT_REASON="sync"
       return
     fi
-
     if next_render_finished; then
       WAIT_REASON="render"
       return
@@ -454,50 +931,38 @@ wait_for_event_or_minute() {
 
     NOW_CLOCK=$(scheduler_now 2>/dev/null)
     if ! is_uint "$NOW_CLOCK" || [ "$NOW_CLOCK" -le 0 ]; then
-      if [ "$CLOCK_SOURCE" = "pmic" ]; then
-        CLOCK_SOURCE=system
-        NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
-        log_message "PMIC clock read failed; falling back to awake system-clock scheduling"
-      fi
       NOW_CLOCK=$(date +%s)
     fi
-
     CLOCK_LATENESS=$((NOW_CLOCK - NEXT_DISPLAY_CLOCK))
     if [ "$CLOCK_LATENESS" -ge 60 ]; then
-      MISSED_MINUTES=$((CLOCK_LATENESS / 60))
       cancel_next_frame_render
-      NEXT_FRAME_EPOCH=$((NEXT_FRAME_EPOCH + MISSED_MINUTES * 60))
-      NEXT_DISPLAY_CLOCK=$((NEXT_DISPLAY_CLOCK + MISSED_MINUTES * 60))
-      log_message "virtual clock catch-up: skipped=$MISSED_MINUTES next_target=$NEXT_FRAME_EPOCH next_display_clock=$NEXT_DISPLAY_CLOCK"
+      # Re-anchor to the minute that is actually on the wall clock. Advancing
+      # by a count of missed minutes can select the following minute instead.
+      NEXT_FRAME_EPOCH=$(minute_epoch "$NOW_CLOCK")
+      NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
+      log_message "virtual clock catch-up: now=$NOW_CLOCK next_target=$NEXT_FRAME_EPOCH next_display_clock=$NEXT_DISPLAY_CLOCK"
       continue
     fi
-
-    REFRESH_DURATION_MS=$(refresh_duration_for_epoch "$NEXT_FRAME_EPOCH")
-    REFRESH_HALF_MS=$((REFRESH_DURATION_MS / 2))
-    REFRESH_EARLY_SECONDS=$(((REFRESH_HALF_MS + 999) / 1000))
-    [ "$REFRESH_EARLY_SECONDS" -lt 1 ] && REFRESH_EARLY_SECONDS=1
-    REFRESH_START_CLOCK=$((NEXT_DISPLAY_CLOCK - REFRESH_EARLY_SECONDS))
-    REFRESH_DELAY_MS=$((REFRESH_EARLY_SECONDS * 1000 - REFRESH_HALF_MS))
-
-    if [ "$NOW_CLOCK" -ge "$REFRESH_START_CLOCK" ]; then
-      if [ "$NOW_CLOCK" -eq "$REFRESH_START_CLOCK" ]; then
-        sleep_ms "$REFRESH_DELAY_MS"
-      fi
+    REFRESH_REFERENCE_CLOCK=$((NEXT_DISPLAY_CLOCK - 1))
+    if [ "$NOW_CLOCK" -ge "$REFRESH_REFERENCE_CLOCK" ]; then
+      prepare_refresh_release "$NOW_CLOCK" || true
       REFRESH_ACTUAL_CLOCK=$(scheduler_now 2>/dev/null)
-      log_message "refresh release: target=$NEXT_FRAME_EPOCH display_clock=$NEXT_DISPLAY_CLOCK duration_ms=$REFRESH_DURATION_MS start_clock=$REFRESH_START_CLOCK delay_ms=$REFRESH_DELAY_MS actual_clock=${REFRESH_ACTUAL_CLOCK:-unknown} uptime=$(monotonic_stamp)"
+      if [ "$DEBUG_LOG" = "1" ]; then
+        log_debug "refresh release: target=$NEXT_FRAME_EPOCH display_clock=$NEXT_DISPLAY_CLOCK profile=$REFRESH_PROFILE_KIND estimate_ms=$REFRESH_DURATION_MS actual_clock=${REFRESH_ACTUAL_CLOCK:-unknown} uptime=$(monotonic_stamp)"
+      fi
       WAIT_REASON="minute"
       return
     fi
-
     IDLE_DEADLINE=$((LAST_INTERACTION_CLOCK + IDLE_SUSPEND_SECONDS))
     WAKE_CLOCK=$((NEXT_DISPLAY_CLOCK - RTC_WAKE_LEAD_SECONDS))
+    LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 1))
     if [ -z "$SYNC_PID" ] && ! next_render_in_progress && \
-       [ "$CLOCK_SOURCE" = "pmic" ] && [ "$NOW_CLOCK" -ge "$IDLE_DEADLINE" ] && \
-       [ "$NOW_CLOCK" -lt "$WAKE_CLOCK" ]; then
+       [ "$NOW_CLOCK" -ge "$IDLE_DEADLINE" ] && \
+       [ "$NOW_CLOCK" -lt "$LATEST_SUSPEND_CLOCK" ]; then
       if try_rtc_suspend "$WAKE_CLOCK"; then
         RTC_FAILURE_LOGGED=0
         if [ "$RTC_WOKE_EARLY" = "1" ]; then
-          LAST_INTERACTION_CLOCK="$RESUME_PMIC"
+          LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
           log_message "early hardware wake; awake interval restarted for ${IDLE_SUSPEND_SECONDS}s"
         fi
         # Give waitforkey time to publish a physical key that caused wake-up.
@@ -511,12 +976,14 @@ wait_for_event_or_minute() {
       sleep 1
       continue
     fi
-
-    pause_briefly
+    if [ "$NOW_CLOCK" -ge $((NEXT_DISPLAY_CLOCK - RTC_WAKE_LEAD_SECONDS)) ]; then
+      sleep_ms 20
+    else
+      pause_briefly
+    fi
   done
   WAIT_REASON="exit"
 }
-
 handle_key_action() {
   SETTINGS_CHANGED=0
   case "$1" in
@@ -557,7 +1024,6 @@ handle_key_action() {
   [ "$SETTINGS_CHANGED" = "1" ] && save_settings
   return 0
 }
-
 start_time_sync() {
   [ -n "$SYNC_PID" ] && return 1
   rm -f "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$SYNC_PID_FILE"
@@ -575,7 +1041,6 @@ start_time_sync() {
   echo "$SYNC_PID" > "$SYNC_PID_FILE"
   return 0
 }
-
 finish_time_sync() {
   SYNC_STATUS=failure
   [ -f "$SYNC_RESULT_FILE" ] && SYNC_STATUS=$(cat "$SYNC_RESULT_FILE" 2>/dev/null)
@@ -590,21 +1055,49 @@ publish_minute_frame() {
   if next_render_finished; then
     finish_next_frame_render
   fi
-
+  META_KIND=""
   META_EPOCH=""
   META_BATTERY=""
-  [ -f "$NEXT_FRAME_META" ] && read META_EPOCH META_BATTERY < "$NEXT_FRAME_META"
+  META_CHANGED_DIGITS=0
+  [ -f "$NEXT_FRAME_META" ] && read META_KIND META_EPOCH META_BATTERY META_CHANGED_DIGITS < "$NEXT_FRAME_META"
   if [ "$NEXT_FRAME_READY" = "1" ] && [ "$META_EPOCH" = "$NEXT_FRAME_EPOCH" ] && \
      is_uint "$META_BATTERY"; then
-    display_frame "$NEXT_FRAME" 0 "$META_EPOCH" "$META_BATTERY"
-    mv "$NEXT_FRAME" "$CURRENT_FRAME"
-    rm -f "$NEXT_FRAME_META"
-    CURRENT_FRAME_BATTERY="$META_BATTERY"
-    NEXT_FRAME_READY=0
-    return 0
+    case "$META_KIND" in
+      partial)
+        NEXT_FRAME_CHANGED_DIGITS="$META_CHANGED_DIGITS"
+        if display_partial_frame "$META_EPOCH"; then
+          rm -f "$NEXT_FRAME_META"
+          CURRENT_FRAME_BATTERY="$META_BATTERY"
+          NEXT_FRAME_READY=0
+          NEXT_FRAME_KIND=""
+          return 0
+        fi
+        log_message "partial display failed; rendering full PNG fallback"
+        touch "$PARTIAL_DISABLED_FILE"
+        BATTERY_LEVEL="$META_BATTERY"
+        CURRENT_FRAME_BATTERY="$META_BATTERY"
+        if render_frame "$META_EPOCH" "$CURRENT_FRAME"; then
+          display_frame "$CURRENT_FRAME" 0 "$META_EPOCH" "$META_BATTERY"
+          rm -f "$NEXT_FRAME_META"
+          NEXT_FRAME_READY=0
+          NEXT_FRAME_KIND=""
+          return 0
+        fi
+        ;;
+      png)
+        if [ -s "$NEXT_FRAME" ]; then
+          display_frame "$NEXT_FRAME" 0 "$META_EPOCH" "$META_BATTERY"
+          mv "$NEXT_FRAME" "$CURRENT_FRAME"
+          rm -f "$NEXT_FRAME_META"
+          CURRENT_FRAME_BATTERY="$META_BATTERY"
+          NEXT_FRAME_READY=0
+          NEXT_FRAME_KIND=""
+          return 0
+        fi
+        ;;
+    esac
   fi
-
-  log_message "next-minute frame rejected: expected_target=$NEXT_FRAME_EPOCH ready=$NEXT_FRAME_READY meta_target=${META_EPOCH:-missing} meta_battery=${META_BATTERY:-missing}"
+  log_message "next-minute frame rejected: expected_target=$NEXT_FRAME_EPOCH ready=$NEXT_FRAME_READY kind=${META_KIND:-missing} meta_target=${META_EPOCH:-missing} meta_battery=${META_BATTERY:-missing}"
   cancel_next_frame_render
   BATTERY_LEVEL=$(get_battery_level)
   CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
@@ -615,34 +1108,43 @@ publish_minute_frame() {
   fi
   return 1
 }
-
 main() {
   mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
-    "$CURRENT_FRAME" "$NEXT_FRAME" "$NEXT_RENDER_WORK" "$NEXT_FRAME_META" \
+    "$CURRENT_FRAME" "$NEXT_FRAME" "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" \
+    "$NEXT_FRAME_META" \
     "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
-    "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP"
-  : > "$LOG_FILE"
+    "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
+    "$RENDER_REQUEST_FIFO" "$PARTIAL_DISABLED_FILE" \
+    "$RUNTIME_DIR"/render-status-*
   load_settings
-
+  start_new_session_log
   ORIGINAL_WIFI_STATE=$(wifi_get_enabled)
   case "$ORIGINAL_WIFI_STATE" in 0|1) ;; *) ORIGINAL_WIFI_STATE="" ;; esac
   log_message "startup: original Wi-Fi state=${ORIGINAL_WIFI_STATE:-unknown}"
+
+  log_message "startup time synchronization requested"
+  if time_sync_now; then
+    log_message "startup time synchronization succeeded"
+  else
+    log_message "startup time synchronization failed; continuing with system time"
+  fi
+  # time_sync_now normally turns Wi-Fi off itself. Enforce the requested
+  # post-sync state on every success and failure path.
   wifi_set_enabled 0
   initialize_virtual_clock
+  start_render_server || log_message "using one-shot renderer for this session"
 
   # Validate the first frame before hiding the Kindle UI.
   if ! render_current_frame; then
     return 1
   fi
-
   /etc/init.d/framework stop >/dev/null 2>&1
   UI_STOPPED=1
   /usr/bin/lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1
   watch_keys &
   KEY_PID=$!
   echo "$KEY_PID" > "$KEY_PID_FILE"
-
   display_frame "$CURRENT_FRAME" 1 "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"
   LAST_INTERACTION_CLOCK=$(scheduler_now 2>/dev/null)
   if ! is_uint "$LAST_INTERACTION_CLOCK"; then
@@ -655,7 +1157,6 @@ main() {
   while [ ! -f "$EXIT_FILE" ]; do
     wait_for_event_or_minute "$NEXT_FRAME_EPOCH"
     [ -f "$EXIT_FILE" ] && break
-
     case "$WAIT_REASON" in
       key)
         log_message "key event: $KEY_ACTION"
@@ -667,7 +1168,11 @@ main() {
           cancel_next_frame_render
           start_time_sync
         elif [ "$KEY_STATUS" -eq 3 ]; then
-          [ -s "$CURRENT_FRAME" ] && display_frame "$CURRENT_FRAME" 1 "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"
+          cancel_next_frame_render
+          if render_current_frame; then
+            display_frame "$CURRENT_FRAME" 1 "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"
+          fi
+          prepare_next_minute
         elif [ "$KEY_STATUS" -eq 0 ]; then
           cancel_next_frame_render
           if render_current_frame; then
@@ -697,14 +1202,22 @@ main() {
       minute)
         publish_minute_frame
         advance_virtual_clock
-        prepare_next_minute
+        if truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"; then
+          log_message "log truncated at ${LOG_MAX_BYTES} bytes"
+        fi
+        FRESH_BATTERY_LEVEL=""
+        if FRESH_BATTERY_LEVEL=$(refresh_battery_sample_after_hourly_full_refresh); then
+          prepare_next_minute "$FRESH_BATTERY_LEVEL"
+        else
+          prepare_next_minute
+        fi
         ;;
     esac
   done
 }
-
 if [ "$1" != "--run" ]; then
   mkdir -p "$LOG_DIR"
+  truncate_log_if_oversize "$LAUNCHER_LOG" "$LAUNCHER_LOG_MAX_BYTES"
   "$0" --run >> "$LAUNCHER_LOG" 2>&1 &
   exit 0
 fi
