@@ -7,7 +7,28 @@
 --   DISPLAY status epoch
 
 require("setupkoenv")
+local ffi = require("ffi")
 local renderer = dofile("/mnt/us/extensions/kfc/src/clock_renderer.lua")
+
+pcall(ffi.cdef, [[
+struct timeval {
+    long tv_sec;
+    long tv_usec;
+};
+]])
+pcall(ffi.cdef, [[
+int gettimeofday(struct timeval *tv, void *tz);
+int settimeofday(const struct timeval *tv, const void *tz);
+]])
+
+local function adjust_system_time(offset_sec)
+    local tv = ffi.new("struct timeval")
+    if ffi.C.gettimeofday(tv, nil) == 0 then
+        tv.tv_sec = tv.tv_sec + offset_sec
+        return ffi.C.settimeofday(tv, nil) == 0
+    end
+    return false
+end
 
 local function split_tabs(line)
     local fields = {}
@@ -89,6 +110,18 @@ for line in io.lines() do
                     refresh_start_cs, refresh_end_cs))
         else
             publish_status(status_path, "ERROR", x)
+        end
+    elseif command == "ADJUST" and #fields == 3 then
+        local offset = tonumber(fields[3]) or 0
+        if offset ~= 0 then
+            local ok = adjust_system_time(offset)
+            if ok then
+                publish_status(status_path, "OK", string.format("ADJUST %d", offset))
+            else
+                publish_status(status_path, "ERROR", "settimeofday failed")
+            end
+        else
+            publish_status(status_path, "OK", "NOOP")
         end
     else
         if status_path and status_path ~= "" then

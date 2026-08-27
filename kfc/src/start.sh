@@ -19,6 +19,8 @@ NEXT_RENDER_PID_FILE="$RUNTIME_DIR/next_render.pid"
 SYNC_PID_FILE="$RUNTIME_DIR/time_sync.pid"
 SYNC_RESULT_FILE="$RUNTIME_DIR/time_sync.result"
 SYNC_RESULT_TMP="$RUNTIME_DIR/time_sync.result.tmp"
+AUTO_SYNC_RESULT_FILE="$RUNTIME_DIR/auto_sync.result"
+AUTO_SYNC_RESULT_TMP="$RUNTIME_DIR/auto_sync.result.tmp"
 RENDER_REQUEST_FIFO="$RUNTIME_DIR/render.request"
 RENDER_SERVER_PID_FILE="$RUNTIME_DIR/render_server.pid"
 PARTIAL_DISABLED_FILE="$RUNTIME_DIR/partial.disabled"
@@ -31,19 +33,20 @@ THEME=light
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=60
+AUTO_TIME_SYNC_INTERVAL_HOURS=0
+AUTO_TIME_CHECK_HOURLY=0
+RTC_DRIFT_COMPENSATION_PPM=1414
+IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
-# Let the K4 gas-gauge driver refresh after the hourly full-screen refresh.
-# The 00-minute frame is shown on time, then the device stays awake long
-# enough to sample a fresh battery value for the 01-minute frame.
-BATTERY_REFRESH_SETTLE_SECONDS=40
+BATTERY_REFRESH_SETTLE_SECONDS=25
+LAST_AUTO_SYNC_EPOCH=0
 SETTINGS_VERSION=""
-CURRENT_SETTINGS_VERSION=4
+CURRENT_SETTINGS_VERSION=5
 SETTINGS_MIGRATED=0
 DEBUG_LOG=0
-LOG_MAX_BYTES=524288
+LOG_MAX_BYTES=4194304
 LAUNCHER_LOG_MAX_BYTES=131072
 HELP_VISIBLE=0
 BATTERY_LEVEL=0
@@ -71,6 +74,7 @@ RTC_FAILURE_LOGGED=0
 RTC_WOKE_EARLY=0
 RTC_RESUME_LATENESS_SECONDS=0
 REFRESH_SCHEDULE_EPOCH=0
+DRIFT_REMAINDER_MS=0
 REFRESH_BOUNDARY_UPTIME_CS=""
 REFRESH_PLANNED_START_UPTIME_CS=""
 REFRESH_PROFILE_KIND=""
@@ -118,10 +122,16 @@ load_settings() {
   [ -f "$SETTINGS_FILE" ] && . "$SETTINGS_FILE"
   is_uint "$SETTINGS_VERSION" || SETTINGS_VERSION=0
   if [ "$SETTINGS_VERSION" -lt "$CURRENT_SETTINGS_VERSION" ]; then
-    # Version 3 shortened the idle interval; version 4 restores a full
-    # three-second RTC wake margin for the Kindle 4's observed resume delay.
-    [ "$SETTINGS_VERSION" -lt 3 ] && IDLE_SUSPEND_SECONDS=60
-    RTC_WAKE_LEAD_SECONDS=3
+    # Version 3 shortened idle; version 4 adjusted lead;
+    # Version 5 adds auto NTP sync, drift compensation, and power optimizations.
+    [ "$SETTINGS_VERSION" -lt 3 ] && IDLE_SUSPEND_SECONDS=15
+    if [ "$SETTINGS_VERSION" -lt 5 ]; then
+      IDLE_SUSPEND_SECONDS=15
+      RTC_WAKE_LEAD_SECONDS=3
+      BATTERY_REFRESH_SETTLE_SECONDS=25
+      AUTO_TIME_SYNC_INTERVAL_HOURS=0
+      RTC_DRIFT_COMPENSATION_PPM=1414
+    fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
   fi
@@ -129,16 +139,20 @@ load_settings() {
   case "$HOUR_MODE" in 12|24) ;; *) HOUR_MODE=24 ;; esac
   case "$THEME" in light|dark) ;; *) THEME=light ;; esac
   is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=45
-  is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=60
+  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=0
+  is_uint "$RTC_DRIFT_COMPENSATION_PPM" || RTC_DRIFT_COMPENSATION_PPM=0
+  is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=15
   is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=3
   is_uint "$PARTIAL_REFRESH_DURATION_MS" || PARTIAL_REFRESH_DURATION_MS=800
   is_uint "$FULL_REFRESH_DURATION_MS" || FULL_REFRESH_DURATION_MS=1400
-  is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=40
+  is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=25
   case "$DEBUG_LOG" in 0|1) ;; *) DEBUG_LOG=0 ;; esac
-  is_uint "$LOG_MAX_BYTES" || LOG_MAX_BYTES=524288
+  case "$AUTO_TIME_CHECK_HOURLY" in 0|1) ;; *) AUTO_TIME_CHECK_HOURLY=0 ;; esac
+  is_uint "$LOG_MAX_BYTES" || LOG_MAX_BYTES=4194304
   [ "$TIME_SYNC_TIMEOUT" -lt 10 ] && TIME_SYNC_TIMEOUT=10
   [ "$TIME_SYNC_TIMEOUT" -gt 180 ] && TIME_SYNC_TIMEOUT=180
-  [ "$IDLE_SUSPEND_SECONDS" -lt 60 ] && IDLE_SUSPEND_SECONDS=60
+  [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -gt 72 ] && AUTO_TIME_SYNC_INTERVAL_HOURS=72
+  [ "$IDLE_SUSPEND_SECONDS" -lt 5 ] && IDLE_SUSPEND_SECONDS=5
   [ "$IDLE_SUSPEND_SECONDS" -gt 3600 ] && IDLE_SUSPEND_SECONDS=3600
   [ "$RTC_WAKE_LEAD_SECONDS" -lt 1 ] && RTC_WAKE_LEAD_SECONDS=1
   [ "$RTC_WAKE_LEAD_SECONDS" -gt 10 ] && RTC_WAKE_LEAD_SECONDS=10
@@ -146,10 +160,9 @@ load_settings() {
   [ "$PARTIAL_REFRESH_DURATION_MS" -gt 5000 ] && PARTIAL_REFRESH_DURATION_MS=5000
   [ "$FULL_REFRESH_DURATION_MS" -lt 100 ] && FULL_REFRESH_DURATION_MS=100
   [ "$FULL_REFRESH_DURATION_MS" -gt 5000 ] && FULL_REFRESH_DURATION_MS=5000
-  [ "$BATTERY_REFRESH_SETTLE_SECONDS" -lt 5 ] && BATTERY_REFRESH_SETTLE_SECONDS=5
   [ "$BATTERY_REFRESH_SETTLE_SECONDS" -gt 50 ] && BATTERY_REFRESH_SETTLE_SECONDS=50
   [ "$LOG_MAX_BYTES" -lt 65536 ] && LOG_MAX_BYTES=65536
-  [ "$LOG_MAX_BYTES" -gt 4194304 ] && LOG_MAX_BYTES=4194304
+  [ "$LOG_MAX_BYTES" -gt 16777216 ] && LOG_MAX_BYTES=16777216
   [ -z "$TIMEZONE" ] && TIMEZONE=CST-8
   case "$NTP_SERVERS" in
     ''|*[!A-Za-z0-9._\ -]*) NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com" ;;
@@ -166,6 +179,9 @@ save_settings() {
     echo "TIMEZONE=$TIMEZONE"
     echo "TIME_SYNC_TIMEOUT=$TIME_SYNC_TIMEOUT"
     echo "NTP_SERVERS=\"$NTP_SERVERS\""
+    echo "AUTO_TIME_SYNC_INTERVAL_HOURS=$AUTO_TIME_SYNC_INTERVAL_HOURS"
+    echo "AUTO_TIME_CHECK_HOURLY=$AUTO_TIME_CHECK_HOURLY"
+    echo "RTC_DRIFT_COMPENSATION_PPM=$RTC_DRIFT_COMPENSATION_PPM"
     echo "IDLE_SUSPEND_SECONDS=$IDLE_SUSPEND_SECONDS"
     echo "RTC_WAKE_LEAD_SECONDS=$RTC_WAKE_LEAD_SECONDS"
     echo "PARTIAL_REFRESH_DURATION_MS=$PARTIAL_REFRESH_DURATION_MS"
@@ -337,6 +353,7 @@ cleanup() {
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
     "$PID_FILE" "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
+    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
     "$RENDER_REQUEST_FIFO" "$CURRENT_FRAME" "$NEXT_FRAME" \
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
@@ -398,12 +415,29 @@ format_monotonic_centiseconds() {
 sleep_ms() {
   DELAY_MS="$1"
   [ "$DELAY_MS" -gt 0 ] || return 0
+
+  DELAY_US=$((DELAY_MS * 1000))
   if command -v usleep >/dev/null 2>&1; then
-    usleep $((DELAY_MS * 1000))
-  else
-    DELAY_SECONDS=$(((DELAY_MS + 999) / 1000))
-    sleep "$DELAY_SECONDS"
+    usleep "$DELAY_US"
+    return
   fi
+
+  if [ -x /bin/busybox-usleep ]; then
+    /bin/busybox-usleep "$DELAY_US"
+    return
+  fi
+
+  if [ -x /bin/busybox ] && \
+     /bin/busybox usleep "$DELAY_US" 2>/dev/null; then
+    return
+  fi
+
+  DELAY_TEXT=$(printf '%d.%03d' \
+    "$((DELAY_MS / 1000))" "$((DELAY_MS % 1000))")
+  sleep "$DELAY_TEXT" 2>/dev/null && return
+
+  DELAY_SECONDS=$(((DELAY_MS + 999) / 1000))
+  sleep "$DELAY_SECONDS"
 }
 
 sleep_until_monotonic_centiseconds() {
@@ -465,6 +499,7 @@ initialize_virtual_clock() {
   NEXT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + 60))
   CLOCK_SOURCE=system
   NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
+  DRIFT_REMAINDER_MS=0
   log_message "virtual clock anchored: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=system display_clock=$NEXT_DISPLAY_CLOCK"
 }
 advance_virtual_clock() {
@@ -511,6 +546,28 @@ wait_renderer_reply() {
     OK|OK\ *) return 0 ;;
     ERROR*) log_message "persistent renderer error: ${SERVER_REPLY#ERROR }" ;;
   esac
+  return 1
+}
+
+adjust_system_time() {
+  OFFSET_SEC="$1"
+  is_uint "${OFFSET_SEC#-}" || return 1
+  [ "$OFFSET_SEC" -eq 0 ] && return 0
+
+  if [ "$RENDER_SERVER_READY" = "1" ]; then
+    RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+    STATUS_PATH="$RUNTIME_DIR/render-status-$RENDER_REQUEST_SEQUENCE"
+    rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+    printf 'ADJUST\t%s\t%s\n' "$STATUS_PATH" "$OFFSET_SEC" > "$RENDER_REQUEST_FIFO" 2>/dev/null
+    wait_renderer_reply "$STATUS_PATH" 500 >/dev/null 2>&1
+    rm -f "$STATUS_PATH"
+    return 0
+  fi
+
+  if [ -x /mnt/us/koreader/luajit ]; then
+    /mnt/us/koreader/luajit -e "local ffi=require('ffi'); ffi.cdef[[struct timeval{long tv_sec;long tv_usec;}; int gettimeofday(struct timeval*,void*); int settimeofday(const struct timeval*,const void*);]]; local tv=ffi.new('struct timeval'); if ffi.C.gettimeofday(tv,nil)==0 then tv.tv_sec=tv.tv_sec+($OFFSET_SEC); ffi.C.settimeofday(tv,nil); end" >/dev/null 2>&1
+    return 0
+  fi
   return 1
 }
 
@@ -843,25 +900,67 @@ refresh_battery_sample_after_hourly_full_refresh() {
   DISPLAYED_MINUTE=$(((CURRENT_FRAME_EPOCH / 60) % 60))
   [ "$DISPLAYED_MINUTE" -eq 0 ] || return 1
 
-  REFRESH_AWAKE_START=$(scheduler_now 2>/dev/null)
-  is_uint "$REFRESH_AWAKE_START" || REFRESH_AWAKE_START=$(date +%s)
-  REFRESH_AWAKE_DEADLINE=$((REFRESH_AWAKE_START + BATTERY_REFRESH_SETTLE_SECONDS))
-  log_debug "battery refresh window: target=$NEXT_FRAME_EPOCH settle=${BATTERY_REFRESH_SETTLE_SECONDS}s old=$CURRENT_FRAME_BATTERY"
+  # Concurrently perform active NTP time sync (when its configured interval is
+  # due) or a passive check while already awake for the battery sample.
+  NTP_SYNC_PID=""
+  AUTO_SYNC_DUE=0
+  AUTO_SYNC_NOW=$(scheduler_now 2>/dev/null)
+  is_uint "$AUTO_SYNC_NOW" || AUTO_SYNC_NOW=0
+  if [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -gt 0 ] && [ -z "$SYNC_PID" ]; then
+    AUTO_SYNC_INTERVAL_SECONDS=$((AUTO_TIME_SYNC_INTERVAL_HOURS * 3600))
+    if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || \
+       [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ] || \
+       [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_INTERVAL_SECONDS" ]; then
+      AUTO_SYNC_DUE=1
+    fi
+  fi
+  if [ "$AUTO_SYNC_DUE" = "1" ]; then
+    rm -f "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP"
+    (
+      if time_sync_now "auto"; then
+        date +%s > "$AUTO_SYNC_RESULT_TMP"
+        mv "$AUTO_SYNC_RESULT_TMP" "$AUTO_SYNC_RESULT_FILE"
+      fi
+    ) &
+    NTP_SYNC_PID=$!
+  elif [ "$AUTO_TIME_CHECK_HOURLY" = "1" ] && [ -z "$SYNC_PID" ]; then
+    (
+      time_sync_now "check_only"
+    ) &
+    NTP_SYNC_PID=$!
+  fi
+
+  if [ "$BATTERY_REFRESH_SETTLE_SECONDS" -le 0 ]; then
+    [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
+    FRESH_BATTERY_LEVEL=$(get_battery_level)
+    log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL (instant)"
+    echo "$FRESH_BATTERY_LEVEL"
+    return 0
+  fi
+
+  REFRESH_AWAKE_START_CS=$(monotonic_centiseconds 2>/dev/null)
+  is_uint "$REFRESH_AWAKE_START_CS" || return 1
+  REFRESH_AWAKE_DEADLINE_CS=$((REFRESH_AWAKE_START_CS + BATTERY_REFRESH_SETTLE_SECONDS * 100))
+  log_message "battery refresh window started: settle=${BATTERY_REFRESH_SETTLE_SECONDS}s old=${CURRENT_FRAME_BATTERY}%"
 
   while [ ! -f "$EXIT_FILE" ]; do
     if [ -f "$KEY_EVENT_FILE" ]; then
+      [ -n "$NTP_SYNC_PID" ] && kill "$NTP_SYNC_PID" 2>/dev/null
+      wifi_set_enabled 0
       log_message "battery refresh window interrupted by key event"
       return 1
     fi
-    REFRESH_AWAKE_NOW=$(scheduler_now 2>/dev/null)
-    is_uint "$REFRESH_AWAKE_NOW" || REFRESH_AWAKE_NOW=$(date +%s)
-    [ "$REFRESH_AWAKE_NOW" -ge "$REFRESH_AWAKE_DEADLINE" ] && break
+    REFRESH_AWAKE_NOW_CS=$(monotonic_centiseconds 2>/dev/null)
+    is_uint "$REFRESH_AWAKE_NOW_CS" || return 1
+
+    [ "$REFRESH_AWAKE_NOW_CS" -ge "$REFRESH_AWAKE_DEADLINE_CS" ] && break
     sleep 1
   done
 
+  [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
   [ -f "$EXIT_FILE" ] && return 1
   FRESH_BATTERY_LEVEL=$(get_battery_level)
-  log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL awake_since=$REFRESH_AWAKE_START"
+  log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL awake_uptime_cs=$REFRESH_AWAKE_START_CS"
   echo "$FRESH_BATTERY_LEVEL"
   return 0
 }
@@ -879,22 +978,37 @@ try_rtc_suspend() {
   [ "$SUSPEND_SECONDS" -ge 2 ] || return 1
   RTC_STATE=$(cat "$RTC_PATH" 2>/dev/null)
   [ "$RTC_STATE" = "0" ] || return 1
-  echo -n "$SUSPEND_SECONDS" > "$RTC_PATH" 2>/dev/null || return 1
+
+  # Set hardware alarm countdown to exact planned suspend duration
+  RTC_ALARM_SECONDS="$SUSPEND_SECONDS"
+  echo -n "$RTC_ALARM_SECONDS" > "$RTC_PATH" 2>/dev/null || return 1
   RTC_WOKE_EARLY=0
   RTC_RESUME_LATENESS_SECONDS=0
   if [ "$DEBUG_LOG" = "1" ]; then
     SUSPEND_START_PMIC=$(read_pmic_epoch 2>/dev/null)
-    log_debug "RTC suspend: planned_wake_system=$EXPECTED_WAKE_SYSTEM current_system=$SUSPEND_START_SYSTEM delay=$SUSPEND_SECONDS pmic=${SUSPEND_START_PMIC:-unknown} display_clock=$NEXT_DISPLAY_CLOCK"
+    log_debug "RTC suspend: planned_wake_system=$EXPECTED_WAKE_SYSTEM current_system=$SUSPEND_START_SYSTEM delay=$SUSPEND_SECONDS rtc_alarm=$RTC_ALARM_SECONDS pmic=${SUSPEND_START_PMIC:-unknown} display_clock=$NEXT_DISPLAY_CLOCK"
   fi
   echo mem > "$POWER_STATE_PATH" 2>> "$LOG_FILE"
   SUSPEND_STATUS=$?
   RESUME_SYSTEM=$(date +%s)
   if is_uint "$RESUME_SYSTEM" && [ "$RESUME_SYSTEM" -gt 0 ]; then
     RTC_RESUME_LATENESS_SECONDS=$((RESUME_SYSTEM - EXPECTED_WAKE_SYSTEM))
-    # A resume at least two seconds before the requested wake time is treated
-    # as a power-button/other hardware wake. PMIC is diagnostics only.
     if [ $((RESUME_SYSTEM + 1)) -lt "$EXPECTED_WAKE_SYSTEM" ]; then
       RTC_WOKE_EARLY=1
+    fi
+
+    # Calculate exact drift accrued during actual sleep time and set back system clock
+    ACTUAL_SLEPT_SECONDS=$((RESUME_SYSTEM - SUSPEND_START_SYSTEM))
+    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$RTC_DRIFT_COMPENSATION_PPM" && [ "$RTC_DRIFT_COMPENSATION_PPM" -gt 0 ]; then
+      is_uint "$DRIFT_REMAINDER_MS" || DRIFT_REMAINDER_MS=0
+      REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * RTC_DRIFT_COMPENSATION_PPM * 1000) / (1000000 + RTC_DRIFT_COMPENSATION_PPM) ))
+      TOTAL_REDUCTION_MS=$(( REDUCTION_MS + DRIFT_REMAINDER_MS ))
+      REDUCTION_SECONDS=$(( TOTAL_REDUCTION_MS / 1000 ))
+      DRIFT_REMAINDER_MS=$(( TOTAL_REDUCTION_MS % 1000 ))
+      if [ "$REDUCTION_SECONDS" -gt 0 ]; then
+        adjust_system_time "-$REDUCTION_SECONDS"
+        log_message "drift clock adjust: setback ${REDUCTION_SECONDS}s (ppm=$RTC_DRIFT_COMPENSATION_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
+      fi
     fi
   fi
   if [ "$DEBUG_LOG" = "1" ]; then
@@ -1025,9 +1139,10 @@ handle_key_action() {
   return 0
 }
 start_time_sync() {
+  SYNC_REASON="${1:-manual}"
   [ -n "$SYNC_PID" ] && return 1
   rm -f "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$SYNC_PID_FILE"
-  log_message "manual time synchronization requested"
+  log_message "$SYNC_REASON time synchronization requested"
   (
     trap 'wifi_set_enabled 0; exit 143' 1 2 15
     if time_sync_now; then
@@ -1115,10 +1230,12 @@ main() {
     "$NEXT_FRAME_META" \
     "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
+    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
     "$RENDER_REQUEST_FIFO" "$PARTIAL_DISABLED_FILE" \
     "$RUNTIME_DIR"/render-status-*
   load_settings
   start_new_session_log
+  log_message "startup: active settings: ppm=$RTC_DRIFT_COMPENSATION_PPM auto_check=$AUTO_TIME_CHECK_HOURLY auto_sync_interval=$AUTO_TIME_SYNC_INTERVAL_HOURS idle_suspend=${IDLE_SUSPEND_SECONDS}s wake_lead=${RTC_WAKE_LEAD_SECONDS}s settle=${BATTERY_REFRESH_SETTLE_SECONDS}s"
   ORIGINAL_WIFI_STATE=$(wifi_get_enabled)
   case "$ORIGINAL_WIFI_STATE" in 0|1) ;; *) ORIGINAL_WIFI_STATE="" ;; esac
   log_message "startup: original Wi-Fi state=${ORIGINAL_WIFI_STATE:-unknown}"
@@ -1126,8 +1243,10 @@ main() {
   log_message "startup time synchronization requested"
   if time_sync_now; then
     log_message "startup time synchronization succeeded"
+    LAST_AUTO_SYNC_EPOCH=$(date +%s)
   else
     log_message "startup time synchronization failed; continuing with system time"
+    LAST_AUTO_SYNC_EPOCH=0
   fi
   # time_sync_now normally turns Wi-Fi off itself. Enforce the requested
   # post-sync state on every success and failure path.
@@ -1187,6 +1306,7 @@ main() {
       sync)
         if finish_time_sync; then
           log_message "time synchronization succeeded"
+          LAST_AUTO_SYNC_EPOCH=$(date +%s)
           cancel_next_frame_render
           initialize_virtual_clock
           if render_current_frame; then
@@ -1207,6 +1327,14 @@ main() {
         fi
         FRESH_BATTERY_LEVEL=""
         if FRESH_BATTERY_LEVEL=$(refresh_battery_sample_after_hourly_full_refresh); then
+          if [ -f "$AUTO_SYNC_RESULT_FILE" ]; then
+            AUTO_SYNC_COMPLETED_EPOCH=$(cat "$AUTO_SYNC_RESULT_FILE" 2>/dev/null)
+            rm -f "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP"
+            if is_uint "$AUTO_SYNC_COMPLETED_EPOCH" && [ "$AUTO_SYNC_COMPLETED_EPOCH" -gt 0 ]; then
+              LAST_AUTO_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
+            fi
+            initialize_virtual_clock
+          fi
           prepare_next_minute "$FRESH_BATTERY_LEVEL"
         else
           prepare_next_minute

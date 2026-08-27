@@ -2,7 +2,7 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.4.5** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.0** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
@@ -10,15 +10,15 @@ The extension shows the time, Gregorian date, weekday, Chinese lunar date, and b
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
 
-## What changed in 2.4.5
+## What changed in 2.5.0
 
-- Added a persistent LuaJIT worker with a FIFO command protocol and required `PING/PONG` startup handshake.
-- Kept FreeType faces, cached 0–9 digit cards, the framebuffer mapping, and the prepared next-minute region in memory.
-- Ordinary minutes update the smallest changed one- or two-digit region through Kindle 4 `FBIO_EINK_UPDATE_DISPLAY_AREA`; they no longer encode a full PNG.
-- Startup synchronizes through KOReader SNTP before the first frame and turns Wi-Fi off afterward.
-- Idle suspend starts after 60 seconds and plans to wake three seconds before each minute.
-- Partial/full scheduling uses fixed 800/1400 ms visible-duration estimates; driver return timings are diagnostics only and never train the scheduler.
-- Added hourly battery-gauge settling, bounded/rotated logs, centisecond timing records, and guarded full-render fallbacks.
+- Added configurable periodic SNTP synchronization, checked hourly and scheduled from the last successful synchronization.
+- Added passive NTP offset checks and configurable `RTC_DRIFT_COMPENSATION_PPM` suspend-clock compensation.
+- Wi-Fi shutdown now also applies the Kindle hardware RF-kill property.
+- Wi-Fi, synchronization, and battery-settle durations use monotonic `/proc/uptime` measurements and are unaffected by SNTP wall-clock steps.
+- Idle suspend now starts after 15 seconds; the hourly full refresh waits 25 seconds for one final battery sample without per-second queries or logs.
+- Fixed `--check-only` modifying system time and positive synchronization intervals always running every hour.
+- Increased the log limit to 4 MiB and upgraded the settings schema to version 5.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 
@@ -33,11 +33,12 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete release notes.
 - Clear-then-redraw full refresh at startup, every hour, and after successful synchronization
 - Back forces a full refresh; Home safely exits
 - Keyboard-key manual synchronization directly through KOReader LuaSocket SNTP
+- Configurable periodic synchronization and optional passive hourly offset checks
 - Alibaba Cloud NTP defaults: `ntp1.aliyun.com`, `ntp2.aliyun.com`, and `ntp.aliyun.com`
 - Persistent settings and physical-key shortcuts
 - First-frame validation before the Kindle framework is stopped
 - Wi-Fi off while the clock runs, temporarily enabled for synchronization, and restored to its launch-time state on exit
-- RTC Suspend-to-RAM after 60 seconds without a physical-key press; the power button wakes the Kindle and restarts the awake interval
+- RTC Suspend-to-RAM after 15 seconds without a physical-key press; the power button wakes the Kindle and restarts the awake interval
 - A persistent renderer avoids loading KOReader graphics libraries and rebuilding digit cards every minute
 - Runtime frames, PIDs, and events in `/tmp/kfc`; persistent USB-visible logs in `kfc/logs`
 
@@ -62,7 +63,7 @@ Do not rename the `kfc` directory; the current scripts use an absolute path.
 
 ### Upgrading from an older release
 
-Version 2.2.3 renamed the extension directory from `kclock` to lowercase `kfc`. Exit the running clock and back up `settings.conf` before upgrading. Version 2.4.5 uses settings schema 4; its first launch migrates the old two-second RTC lead to three seconds and adds battery, debug, and log-limit settings. Remove `/mnt/us/extensions/kclock` only after the new version starts correctly.
+Version 2.2.3 renamed the extension directory from `kclock` to lowercase `kfc`. Exit the running clock and back up `settings.conf` before upgrading. Version 2.5.0 uses settings schema 5 and adds automatic synchronization, RTC drift compensation, and new power defaults. Remove `/mnt/us/extensions/kclock` only after the new version starts correctly.
 
 ## Physical-key shortcuts
 
@@ -84,27 +85,30 @@ The directional pad and right next-page key are currently unassigned.
 `kfc/settings.conf` contains:
 
 ```sh
-SETTINGS_VERSION=4
+SETTINGS_VERSION=5
 ORIENTATION=landscape_left
-HOUR_MODE=12
+HOUR_MODE=24
 THEME=dark
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=60
+AUTO_TIME_SYNC_INTERVAL_HOURS=1
+AUTO_TIME_CHECK_HOURLY=0
+RTC_DRIFT_COMPENSATION_PPM=1414
+IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
-BATTERY_REFRESH_SETTLE_SECONDS=40
+BATTERY_REFRESH_SETTLE_SECONDS=25
 DEBUG_LOG=0
-LOG_MAX_BYTES=524288
+LOG_MAX_BYTES=4194304
 ```
 
-`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `IDLE_SUSPEND_SECONDS` accepts 60–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 5–50 seconds.
+`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `AUTO_TIME_SYNC_INTERVAL_HOURS` accepts 0–72 (`0` disables it), `AUTO_TIME_CHECK_HOURLY=1` enables passive checks, and `RTC_DRIFT_COMPENSATION_PPM=0` disables drift compensation. `IDLE_SUSPEND_SECONDS` accepts 5–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 0–50 seconds.
 
 ## Rendering
 
-The extension uses KOReader's LuaJIT, FreeType, and BlitBuffer. A persistent worker receives `RENDER`, `PREPARE`, and `DISPLAY` commands over a FIFO. Full frames are still encoded as 600×800 PNGs for startup, hourly cleanup, setting/help changes, synchronization, and fallbacks. Ordinary minutes compare four digits, assemble only the changed card region, rotate it to physical framebuffer coordinates, copy it into `/dev/fb0`, and submit an eInkFB partial update. The worker keeps its font faces, digit cache, framebuffer mapping, and prepared region alive between minutes. After 60 seconds without a key press, the clock suspends and requests an RTC wake three seconds before the next target. Home restores Wi-Fi, the sleep policy, and the Kindle framework before exit.
+The extension uses KOReader's LuaJIT, FreeType, and BlitBuffer. A persistent worker receives `RENDER`, `PREPARE`, `DISPLAY`, and clock-adjustment commands over a FIFO. Full frames are still encoded as 600×800 PNGs for startup, hourly cleanup, setting/help changes, synchronization, and fallbacks. Ordinary minutes compare four digits, assemble only the changed card region, rotate it to physical framebuffer coordinates, copy it into `/dev/fb0`, and submit an eInkFB partial update. The worker keeps its font faces, digit cache, framebuffer mapping, and prepared region alive between minutes. After 15 seconds without a key press, the clock suspends and requests an RTC wake three seconds before the next target. Home restores Wi-Fi, the sleep policy, and the Kindle framework before exit.
 
 Logs:
 

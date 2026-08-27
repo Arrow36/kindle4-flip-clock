@@ -2,7 +2,7 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.4.5** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.5.0** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
@@ -10,19 +10,17 @@
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
 
-## 2.4.5 的主要修改
+## 2.5.0 的主要修改
 
-本次更新不是单纯调整刷新参数，而是重新整理了分钟渲染、休眠和日志链路：
+本次更新重点改善 Kindle 4 长时间休眠运行时的校时、漂移补偿和耗时统计：
 
-- 新增常驻 LuaJIT 渲染进程，通过 FIFO 接收 `PING`、`RENDER`、`PREPARE` 和 `DISPLAY` 命令；启动时必须通过 `PING/PONG` 自检。
-- FreeType 字体、0–9 数字卡片、Framebuffer 映射和下一分钟区域常驻内存，避免每分钟重新加载 KOReader 图形库。
-- 普通分钟比较四位数字，只预生成变化卡片的最小联合区域；例如 `18:01→18:02` 更新一个数字，`18:09→18:10` 更新两个数字。
-- Kindle 4 直接将 8 位灰度区域复制到 `/dev/fb0`，并使用 `FBIO_EINK_UPDATE_DISPLAY_AREA` 请求 eInkFB 局刷；兼容代码仍保留 MXCFB 分支。
-- 启动时先联网 SNTP 校时，随后强制关闭 Wi-Fi；运行中只有键盘键手动校时时会临时联网。
-- 无按键 60 秒后进入 RTC Suspend，每分钟计划提前 3 秒唤醒；数字局刷固定按 800 ms、整屏刷新固定按 1400 ms 安排，不再根据驱动返回时间自动学习。
-- 整点完整刷新后保持清醒 40 秒再读取电量，普通分钟沿用该电量，避免电池采样触发整屏重画。
-- `kfc.log` 限制为 512 KiB，并保留上一轮 `kfc.log.1`；普通状态约每分钟一条摘要，`DEBUG_LOG=1` 可开启详细调度记录。
-- 常驻渲染器、FIFO、Framebuffer 或局刷失败时会逐级回退到一次性 LuaJIT 和完整 PNG，不会直接中断时钟。
+- 新增按小时配置的自动 SNTP 校时；只在距离上次成功校时达到设定间隔后的整点执行，失败会在下一整点重试。
+- 新增不会设置系统时间的被动 NTP 偏差检测，以及可配置的 `RTC_DRIFT_COMPENSATION_PPM` 休眠时钟补偿。
+- Wi-Fi 关闭时同时应用 Kindle 硬件 RF kill；启动、手动和计划校时之外保持无线关闭。
+- Wi-Fi 联网、校时总耗时和整点电池稳定等待改用 `/proc/uptime` 单调计时，不受 SNTP 前后拨动系统时间影响。
+- 无按键 15 秒后进入 RTC Suspend；整点全刷后等待 25 秒读取最终电量，不再逐秒查询或记录电池状态。
+- 修复 `--check-only` 仍会修改系统时间，以及任意正数自动校时间隔都会退化为每小时校时的问题。
+- 日志上限调整为 4 MiB，设置格式升级到版本 5。
 
 详细版本记录见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -38,11 +36,12 @@
 - 启动、每个整点和成功校时后执行全屏清除并重画
 - 返回键可随时强制全刷；Home 安全退出
 - 键盘键直接使用 KOReader LuaSocket SNTP 手动校时
+- 支持按小时配置的后台自动校时和可选被动偏差检测
 - 默认使用阿里云 `ntp1.aliyun.com`、`ntp2.aliyun.com`、`ntp.aliyun.com`
 - 实体键实时控制，设置会写入 `settings.conf` 并在下次启动时保留
 - 启动前先验证首帧，渲染失败时不会先关闭 Kindle 原界面
 - 时钟运行时关闭 Wi-Fi，仅校时时临时开启；退出后恢复启动前状态
-- 启动或最后一次按键后清醒 60 秒，随后在分钟间隔进入 RTC Suspend；电源键可人工唤醒
+- 启动或最后一次按键后清醒 15 秒，随后在分钟间隔进入 RTC Suspend；电源键可人工唤醒
 - 普通分钟通过 eInkFB 局部刷新变化数字；整点、设置变化和故障回退仍使用完整 PNG
 - 显示分钟从启动或 SNTP 校准建立的时间锚点按 60 秒推进
 - 帧、PID 和事件位于 `/tmp/kfc`，日志持久保存在 `kfc/logs`
@@ -81,7 +80,7 @@
 
 ### 从旧版本升级
 
-2.2.3 已将扩展目录从 `kclock` 改为小写 `kfc`。升级前先退出正在运行的时钟，并备份旧目录中的 `settings.conf`。2.4.5 的设置版本为 4，首次启动会把旧的 RTC 提前 2 秒迁移为 3 秒，并补充电池刷新、调试和日志限制参数。确认新版能够从 KUAL 正常启动后，再删除旧的 `/mnt/us/extensions/kclock`，以免菜单中同时出现两个入口。
+2.2.3 已将扩展目录从 `kclock` 改为小写 `kfc`。升级前先退出正在运行的时钟，并备份旧目录中的 `settings.conf`。2.5.0 的设置版本为 5，首次启动会加入自动校时、RTC 漂移补偿和新的省电默认值。确认新版能够从 KUAL 正常启动后，再删除旧的 `/mnt/us/extensions/kclock`，以免菜单中同时出现两个入口。
 
 ## 时钟运行时的实体键
 
@@ -105,10 +104,10 @@
 3. 常驻渲染器提前比较当前分钟和下一分钟，只组装变化数字的 BB8 区域并保存在内存中。
 4. 普通分钟将该区域复制进 `/dev/fb0`，再调用 Kindle 4 eInkFB 局刷 ioctl；`09→10` 等进位更新两个数字。
 5. 启动、整点、设置或说明变化、成功校时、返回键和局刷回退仍生成完整 PNG，并通过 `eips` 显示。
-6. 启动或实体键后保持清醒 60 秒；之后在下一分钟缓存准备完成时进入 RTC Suspend，计划在边界前 3 秒唤醒。
+6. 启动或实体键后保持清醒 15 秒；之后在下一分钟缓存准备完成时进入 RTC Suspend，计划在边界前 3 秒唤醒。
 7. 唤醒后的最后一秒使用 `/proc/uptime` 记录百分之一秒调度数据；局刷采用固定 800 ms 估计，整屏采用固定 1400 ms 估计。
 8. eInkFB ioctl 可能在物理波形结束前返回，因此测得耗时只写日志，不用于自动修改刷新参数。
-9. 每个整点完整刷新后等待 40 秒再读取一次电量，其他分钟沿用该值。
+9. 每个整点完整刷新后等待 25 秒再读取一次电量；自动校时到期时会并行完成联网和 SNTP，其他分钟沿用该电量。
 10. Home 退出后停止后台任务、取消 RTC、恢复 Wi-Fi 原状态、休眠策略和 Kindle framework。
 
 这里的“重新启动 framework”只是恢复 Kindle 图形界面，不是重启整台设备。
@@ -118,20 +117,23 @@
 配置文件位于 `kfc/settings.conf`：
 
 ```sh
-SETTINGS_VERSION=4
+SETTINGS_VERSION=5
 ORIENTATION=landscape_left
-HOUR_MODE=12
+HOUR_MODE=24
 THEME=dark
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-IDLE_SUSPEND_SECONDS=60
+AUTO_TIME_SYNC_INTERVAL_HOURS=1
+AUTO_TIME_CHECK_HOURLY=0
+RTC_DRIFT_COMPENSATION_PPM=1414
+IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
-BATTERY_REFRESH_SETTLE_SECONDS=40
+BATTERY_REFRESH_SETTLE_SECONDS=25
 DEBUG_LOG=0
-LOG_MAX_BYTES=524288
+LOG_MAX_BYTES=4194304
 ```
 
 可用值：
@@ -142,13 +144,16 @@ LOG_MAX_BYTES=524288
 - `TIMEZONE`：POSIX TZ 字符串；中国标准时间使用 `CST-8`
 - `TIME_SYNC_TIMEOUT`：手动校时等待 Wi-Fi 联网的最长秒数，允许 10–180
 - `NTP_SERVERS`：NTP 服务器列表，默认使用三个阿里云公网地址
-- `IDLE_SUSPEND_SECONDS`：最后一次实体键后保持清醒的秒数，默认 60，允许 60–3600
+- `AUTO_TIME_SYNC_INTERVAL_HOURS`：距离上次成功校时至少经过多少小时才再次自动校时；`0` 禁用，允许 0–72
+- `AUTO_TIME_CHECK_HOURLY`：`1` 在未执行自动校时的整点被动检测 NTP 偏差；不会设置系统时间
+- `RTC_DRIFT_COMPENSATION_PPM`：休眠恢复后的系统时钟漂移补偿，`0` 禁用
+- `IDLE_SUSPEND_SECONDS`：最后一次实体键后保持清醒的秒数，默认 15，允许 5–3600
 - `RTC_WAKE_LEAD_SECONDS`：分钟边界前提前唤醒的秒数，默认 3，允许 1–10
 - `PARTIAL_REFRESH_DURATION_MS`：普通分钟刷新预计可见耗时，默认 800 毫秒，允许 100–5000
 - `FULL_REFRESH_DURATION_MS`：整点清屏重画预计可见耗时，默认 1400 毫秒，允许 100–5000
-- `BATTERY_REFRESH_SETTLE_SECONDS`：整点全刷后等待电量计稳定的秒数，默认 40，允许 5–50
+- `BATTERY_REFRESH_SETTLE_SECONDS`：整点全刷后等待电量计稳定的秒数，默认 25，允许 0–50
 - `DEBUG_LOG`：`1` 记录详细的渲染、RTC 和调度信息；默认 `0`
-- `LOG_MAX_BYTES`：`kfc.log` 最大字节数，默认 524288
+- `LOG_MAX_BYTES`：`kfc.log` 最大字节数，默认 4194304
 
 POSIX TZ 的正负号与常见 UTC 写法相反。例如 UTC+8 写作 `CST-8`。
 

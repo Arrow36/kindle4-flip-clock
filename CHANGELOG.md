@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.0 - 2026-08-27
+
+### Added
+
+- Configurable periodic SNTP synchronization, checked at each hour and scheduled from the last successful synchronization
+- Optional passive hourly NTP offset checks for clock-drift diagnostics
+- Configurable RTC suspend/resume wall-clock compensation through `RTC_DRIFT_COMPENSATION_PPM`
+- Persistent-renderer `ADJUST` requests for applying whole-second clock corrections without starting another LuaJIT process
+
+### Changed
+
+- Wi-Fi shutdown now also applies the Kindle hardware RF-kill property
+- Idle suspend now defaults to 15 seconds and hourly battery settling to 25 seconds
+- Wi-Fi connection, synchronization, and battery-settle durations now use monotonic `/proc/uptime` measurements, so SNTP wall-clock steps cannot create negative or extended waits
+- Runtime logs now allow up to 4 MiB and no longer query or log battery status every second during the hourly settle window
+- Settings schema is now version 5
+
+### Fixed
+
+- `--check-only` now observes NTP offset without calling `settimeofday`
+- `AUTO_TIME_SYNC_INTERVAL_HOURS` now honors its configured interval instead of synchronizing every hour for every positive value
+- Automatic synchronization only re-anchors the virtual clock after a successful result and retries a failure at the next hourly check
+- KUAL metadata, packaged documentation, and release version now agree on 2.5.0
+
 ## 2.4.5 - 2026-08-21
 
 ### Added

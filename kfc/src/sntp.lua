@@ -67,6 +67,10 @@ local function set_system_time(unix_time)
     return true
 end
 
+-- Declare this before synchronize(): Lua lexical scope starts at the
+-- declaration, so a later local would make synchronize() read a global.
+local check_only = false
+
 local function synchronize(server)
     local udp, create_error = socket.udp()
     if not udp then return nil, "UDP socket creation failed: " .. tostring(create_error) end
@@ -119,30 +123,68 @@ local function synchronize(server)
         return nil, "server returned an implausible time"
     end
 
-    local set_ok, set_error = set_system_time(corrected_time)
-    if not set_ok then return nil, set_error end
+    if not check_only then
+        local set_ok, set_error = set_system_time(corrected_time)
+        if not set_ok then return nil, set_error end
+    end
     return {offset = offset, delay = delay, stratum = stratum}
 end
 
 local servers = {}
-for index = 1, #arg do servers[#servers + 1] = arg[index] end
+for index = 1, #arg do
+    if arg[index] == "--check-only" then
+        check_only = true
+    else
+        servers[#servers + 1] = arg[index]
+    end
+end
 if #servers == 0 then
     servers = {"ntp1.aliyun.com", "ntp2.aliyun.com", "ntp.aliyun.com"}
 end
 
-for _, server in ipairs(servers) do
-    io.stdout:write("SNTP trying " .. server .. "\n")
+local prefix = check_only and "SNTP check: " or "SNTP success: "
+local cache_path = "/tmp/kfc/last_sntp_check"
+local function sntp_log(msg)
+    local ts = os.date("[%Y-%m-%d %H:%M:%S] ")
+    io.stdout:write(ts .. msg .. "\n")
     io.stdout:flush()
+end
+
+for _, server in ipairs(servers) do
+    sntp_log("SNTP trying " .. server)
     local result, err = synchronize(server)
     if result then
-        io.stdout:write(string.format(
-            "SNTP success: server=%s stratum=%d offset=%.6fs delay=%.6fs\n",
-            server, result.stratum, result.offset, result.delay
+        local extra = ""
+        local now_epoch = socket.gettime()
+        local last_file = io.open(cache_path, "r")
+        if last_file then
+            local content = last_file:read("*a")
+            last_file:close()
+            local last_epoch, last_offset = content:match("([%d%.]+)%s+([%-%d%.]+)")
+            last_epoch = tonumber(last_epoch)
+            last_offset = tonumber(last_offset)
+            if last_epoch and last_offset and (now_epoch - last_epoch) > 5 then
+                local delta_s = result.offset - last_offset
+                local elapsed_s = now_epoch - last_epoch
+                local ppm = (delta_s / elapsed_s) * 1000000
+                extra = string.format(" (delta=%+.4fs in %.0fs, rate=%+.1f ppm)", delta_s, elapsed_s, ppm)
+            end
+        end
+
+        local write_file = io.open(cache_path, "w")
+        if write_file then
+            local stored_offset = check_only and result.offset or 0.0
+            write_file:write(string.format("%.4f %.6f\n", now_epoch, stored_offset))
+            write_file:close()
+        end
+
+        sntp_log(string.format(
+            "%sserver=%s stratum=%d offset=%+.6fs delay=%.6fs%s",
+            prefix, server, result.stratum, result.offset, result.delay, extra
         ))
         os.exit(0)
     end
-    io.stdout:write("SNTP failed: " .. server .. ": " .. tostring(err) .. "\n")
-    io.stdout:flush()
+    sntp_log("SNTP failed: " .. server .. ": " .. tostring(err))
 end
 
 os.exit(1)
