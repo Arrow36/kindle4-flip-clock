@@ -42,6 +42,7 @@ PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
 BATTERY_REFRESH_SETTLE_SECONDS=25
 LAST_AUTO_SYNC_EPOCH=0
+LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
 CURRENT_SETTINGS_VERSION=5
 SETTINGS_MIGRATED=0
@@ -358,11 +359,67 @@ cleanup() {
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
 }
+calc_battery_from_voltage() {
+  V="$1"
+  is_uint "$V" || return 1
+  [ "$V" -ge 2500 ] && [ "$V" -le 4500 ] || return 1
+  if [ "$V" -ge 4120 ]; then
+    echo 100
+  elif [ "$V" -ge 4050 ]; then
+    echo $(( 85 + (V - 4050) * 15 / 70 ))
+  elif [ "$V" -ge 3950 ]; then
+    echo $(( 70 + (V - 3950) * 15 / 100 ))
+  elif [ "$V" -ge 3850 ]; then
+    echo $(( 55 + (V - 3850) * 15 / 100 ))
+  elif [ "$V" -ge 3770 ]; then
+    echo $(( 40 + (V - 3770) * 15 / 80 ))
+  elif [ "$V" -ge 3700 ]; then
+    echo $(( 25 + (V - 3700) * 15 / 70 ))
+  elif [ "$V" -ge 3620 ]; then
+    echo $(( 15 + (V - 3620) * 10 / 80 ))
+  elif [ "$V" -ge 3520 ]; then
+    echo $(( 5 + (V - 3520) * 10 / 100 ))
+  elif [ "$V" -ge 3420 ]; then
+    echo $(( 1 + (V - 3420) * 4 / 100 ))
+  else
+    echo 0
+  fi
+}
+
 get_battery_level() {
+  VOLT=$(get_battery_voltage)
+  if [ -n "$VOLT" ]; then
+    LEVEL=$(calc_battery_from_voltage "$VOLT")
+    if is_uint "$LEVEL"; then
+      [ "$LEVEL" -gt 100 ] && LEVEL=100
+      echo "$LEVEL"
+      return 0
+    fi
+  fi
   LEVEL=$(gasgauge-info -c 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
   case "$LEVEL" in ''|*[!0-9]*) LEVEL=0 ;; esac
   [ "$LEVEL" -gt 100 ] && LEVEL=100
   echo "$LEVEL"
+}
+
+get_battery_voltage() {
+  VOLT=$(gasgauge-info -v 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+  case "$VOLT" in
+    ''|*[!0-9]*)
+      if [ -r /sys/devices/system/yoshi_battery/yoshi_battery0/battery_voltage ]; then
+        VOLT=$(cat /sys/devices/system/yoshi_battery/yoshi_battery0/battery_voltage 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+      fi
+      ;;
+  esac
+  case "$VOLT" in
+    ''|*[!0-9]*) VOLT="" ;;
+    *)
+      if [ "$VOLT" -gt 10000 ]; then
+        VOLT=$((VOLT / 1000))
+      fi
+      ;;
+  esac
+  echo "$VOLT"
 }
 
 minute_epoch() {
@@ -907,10 +964,11 @@ refresh_battery_sample_after_hourly_full_refresh() {
   AUTO_SYNC_NOW=$(scheduler_now 2>/dev/null)
   is_uint "$AUTO_SYNC_NOW" || AUTO_SYNC_NOW=0
   if [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -gt 0 ] && [ -z "$SYNC_PID" ]; then
-    AUTO_SYNC_INTERVAL_SECONDS=$((AUTO_TIME_SYNC_INTERVAL_HOURS * 3600))
+    AUTO_SYNC_THRESHOLD_SECONDS=$(( AUTO_TIME_SYNC_INTERVAL_HOURS * 3600 - 300 ))
+    [ "$AUTO_SYNC_THRESHOLD_SECONDS" -lt 1800 ] && AUTO_SYNC_THRESHOLD_SECONDS=1800
     if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || \
        [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ] || \
-       [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_INTERVAL_SECONDS" ]; then
+       [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
       AUTO_SYNC_DUE=1
     fi
   fi
@@ -933,7 +991,13 @@ refresh_battery_sample_after_hourly_full_refresh() {
   if [ "$BATTERY_REFRESH_SETTLE_SECONDS" -le 0 ]; then
     [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
     FRESH_BATTERY_LEVEL=$(get_battery_level)
-    log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL (instant)"
+    FRESH_BATTERY_VOLT=$(get_battery_voltage)
+    VOLT_MSG=""
+    if [ -n "$FRESH_BATTERY_VOLT" ]; then
+      VOLT_MSG=" (${FRESH_BATTERY_VOLT}mV)"
+      echo "$FRESH_BATTERY_VOLT" > "$RUNTIME_DIR/battery.volt"
+    fi
+    log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL$VOLT_MSG (instant)"
     echo "$FRESH_BATTERY_LEVEL"
     return 0
   fi
@@ -941,7 +1005,10 @@ refresh_battery_sample_after_hourly_full_refresh() {
   REFRESH_AWAKE_START_CS=$(monotonic_centiseconds 2>/dev/null)
   is_uint "$REFRESH_AWAKE_START_CS" || return 1
   REFRESH_AWAKE_DEADLINE_CS=$((REFRESH_AWAKE_START_CS + BATTERY_REFRESH_SETTLE_SECONDS * 100))
-  log_message "battery refresh window started: settle=${BATTERY_REFRESH_SETTLE_SECONDS}s old=${CURRENT_FRAME_BATTERY}%"
+  START_VOLT=$(get_battery_voltage)
+  START_VOLT_MSG=""
+  [ -n "$START_VOLT" ] && START_VOLT_MSG=" (${START_VOLT}mV)"
+  log_message "battery refresh window started: settle=${BATTERY_REFRESH_SETTLE_SECONDS}s old=${CURRENT_FRAME_BATTERY}%$START_VOLT_MSG"
 
   while [ ! -f "$EXIT_FILE" ]; do
     if [ -f "$KEY_EVENT_FILE" ]; then
@@ -960,7 +1027,13 @@ refresh_battery_sample_after_hourly_full_refresh() {
   [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
   [ -f "$EXIT_FILE" ] && return 1
   FRESH_BATTERY_LEVEL=$(get_battery_level)
-  log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL awake_uptime_cs=$REFRESH_AWAKE_START_CS"
+  FRESH_BATTERY_VOLT=$(get_battery_voltage)
+  VOLT_MSG=""
+  if [ -n "$FRESH_BATTERY_VOLT" ]; then
+    VOLT_MSG=" (${FRESH_BATTERY_VOLT}mV)"
+    echo "$FRESH_BATTERY_VOLT" > "$RUNTIME_DIR/battery.volt"
+  fi
+  log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL$VOLT_MSG awake_uptime_cs=$REFRESH_AWAKE_START_CS"
   echo "$FRESH_BATTERY_LEVEL"
   return 0
 }
@@ -999,15 +1072,20 @@ try_rtc_suspend() {
 
     # Calculate exact drift accrued during actual sleep time and set back system clock
     ACTUAL_SLEPT_SECONDS=$((RESUME_SYSTEM - SUSPEND_START_SYSTEM))
-    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$RTC_DRIFT_COMPENSATION_PPM" && [ "$RTC_DRIFT_COMPENSATION_PPM" -gt 0 ]; then
+    CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
+    EFFECTIVE_PPM="$RTC_DRIFT_COMPENSATION_PPM"
+    if is_uint "$CURRENT_VOLT" && [ "$CURRENT_VOLT" -lt 3950 ]; then
+      EFFECTIVE_PPM=0
+    fi
+    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$EFFECTIVE_PPM" && [ "$EFFECTIVE_PPM" -gt 0 ]; then
       is_uint "$DRIFT_REMAINDER_MS" || DRIFT_REMAINDER_MS=0
-      REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * RTC_DRIFT_COMPENSATION_PPM * 1000) / (1000000 + RTC_DRIFT_COMPENSATION_PPM) ))
+      REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * EFFECTIVE_PPM * 1000) / (1000000 + EFFECTIVE_PPM) ))
       TOTAL_REDUCTION_MS=$(( REDUCTION_MS + DRIFT_REMAINDER_MS ))
       REDUCTION_SECONDS=$(( TOTAL_REDUCTION_MS / 1000 ))
       DRIFT_REMAINDER_MS=$(( TOTAL_REDUCTION_MS % 1000 ))
       if [ "$REDUCTION_SECONDS" -gt 0 ]; then
         adjust_system_time "-$REDUCTION_SECONDS"
-        log_message "drift clock adjust: setback ${REDUCTION_SECONDS}s (ppm=$RTC_DRIFT_COMPENSATION_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
+        log_message "drift clock adjust: setback ${REDUCTION_SECONDS}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
       fi
     fi
   fi
@@ -1258,6 +1336,13 @@ main() {
   if ! render_current_frame; then
     return 1
   fi
+  STARTUP_VOLT=$(get_battery_voltage)
+  STARTUP_VOLT_MSG=""
+  if [ -n "$STARTUP_VOLT" ]; then
+    STARTUP_VOLT_MSG=" (${STARTUP_VOLT}mV)"
+    echo "$STARTUP_VOLT" > "$RUNTIME_DIR/battery.volt"
+  fi
+  log_message "startup battery: level=${CURRENT_FRAME_BATTERY}%$STARTUP_VOLT_MSG"
   /etc/init.d/framework stop >/dev/null 2>&1
   UI_STOPPED=1
   /usr/bin/lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1

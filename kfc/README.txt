@@ -1,4 +1,4 @@
-kfc (Kindle Flip Clock) 2.5.0
+kfc (Kindle Flip Clock) 2.5.1
 
 Requirements:
 - jailbroken Kindle 4 Non-Touch
@@ -16,9 +16,11 @@ network is unavailable, startup continues with the existing system time after
 the configured synchronization timeout.
 
 Periodic automatic time synchronization can also run quietly in the background
-(e.g., every 4 hours, configurable via AUTO_TIME_SYNC_INTERVAL_HOURS in settings.conf)
-at the top of the hour to eliminate long-term clock drift. Hardware RTC oscillator
-drift can additionally be calibrated and compensated via RTC_DRIFT_COMPENSATION_PPM.
+(e.g., every 1 or 4 hours, configurable via AUTO_TIME_SYNC_INTERVAL_HOURS in settings.conf)
+at the top of the hour to eliminate long-term clock drift. A 5-minute margin ensures
+hourly synchronization does not skip intervals due to network latency.
+Hardware RTC oscillator drift can additionally be calibrated via RTC_DRIFT_COMPENSATION_PPM,
+which is dynamically suppressed below 3950mV to adapt to battery voltage characteristics.
 
 Exit with the Home button.
 Press Back to clear the screen and force a complete redraw.
@@ -40,7 +42,9 @@ Handshake status text is normalized to a single Lua return value so protocol
 details cannot acquire the extra replacement-count value returned by gsub().
 
 Startup, every hour, successful time synchronization, settings/help changes,
-Back, and battery-display changes still use a complete frame. The battery is
+Back, and battery-display changes still use a complete frame. Battery level is
+estimated from physical voltage (gasgauge-info -v / sysfs) using an empirical
+piecewise model to bypass Kindle 4 coulomb counter drift. The battery is
 sampled after the hourly refresh and retained between samples, so it cannot
 force an otherwise time-only update each minute. E Ink refresh begins before
 the virtual minute boundary so the visible transition is centered around it.
@@ -51,10 +55,10 @@ FULL_REFRESH_DURATION_MS settings; asynchronous driver return times are
 diagnostics only and never change the selected timing.
 
 Ordinary steady-state logging is one summary line per displayed minute. The
-hourly battery-settle window logs only its start and final sample. kfc.log is
-capped at 4 MiB and the previous launch is retained as kfc.log.1. Set
-DEBUG_LOG=1 in settings.conf only while collecting detailed render and RTC
-diagnostics.
+hourly battery-settle window logs only its start and final sample, including
+physical voltage in millivolts (e.g. 4050mV). kfc.log is capped at 4 MiB and
+the previous launch is retained as kfc.log.1. Set DEBUG_LOG=1 in settings.conf
+only while collecting detailed render and RTC diagnostics.
 
 Wi-Fi stays off while the clock runs and is enabled only for startup, manual, or
 periodic scheduled time synchronization. Hardware RF kill (wirelessEnable 0) is

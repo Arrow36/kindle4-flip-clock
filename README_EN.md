@@ -2,13 +2,33 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.0** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.1** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.1 (Field-tested fixes & optimizations)
+
+Based on a 144.5-hour (~6-day) complete discharge run and long-term diagnostic telemetry, this release addresses battery percentage distortion, missed hourly NTP synchronizations, and low-voltage clock drift:
+
+1. **Empirical Voltage-Based Battery Percentage Model (Fixes persistent 0% bug)**:
+   - **Rationale**: The Kindle 4 fuel gauge coulomb counter (`gasgauge-info -c`) suffers from severe charge-integration decay during frequent Suspend-to-RAM cycles and on aging batteries. In a 144.5-hour discharge test, the coulomb counter dropped to 0% after just 18 hours (with cell voltage still at 4038mV), leaving the clock running for another 127 hours (88% of total battery life) displaying 0%. Physical cell voltage does not drift with sleep cycles.
+   - **Implementation**: Added `get_battery_voltage()` (`gasgauge-info -v` and sysfs fallback) and `calc_battery_from_voltage()`. Implemented a calibrated piecewise non-linear interpolation model ($\ge 4120\text{mV} \to 100\%$, $4050\text{mV} \to 85\%$, $3950\text{mV} \to 70\%$, $3850\text{mV} \to 55\%$, $3770\text{mV} \to 40\%$, $3700\text{mV} \to 25\%$, $3620\text{mV} \to 15\%$, $3520\text{mV} \to 5\%$, $3420\text{mV} \to 1\%$, shutdown cutoff ~3413mV). `get_battery_level()` now prioritizes physical voltage, using the coulomb counter only as a fallback.
+
+2. **Fixed Hourly Auto-SNTP Interval Boundary Skip Bug**:
+   - **Rationale**: Periodic synchronization runs on the hour, but Wi-Fi initialization, DHCP, and SNTP take 6–10 seconds, landing completion around `XX:00:07`. When the next top-of-hour arrives, elapsed time is ~3593 seconds ($< 3600\text{s}$), causing the check to falsely report that the interval has not yet elapsed and skipping the hour, turning a 1-hour interval into a 2-hour interval.
+   - **Implementation**: Added a 300-second (5-minute) threshold margin (`AUTO_TIME_SYNC_INTERVAL_HOURS * 3600 - 300`) to guarantee reliable hourly execution.
+
+3. **Voltage-Adaptive RTC Drift Compensation Suppression**:
+   - **Rationale**: Physical measurements showed the 32.768kHz crystal oscillator frequency shifts with battery voltage. While the battery is full ($\ge 3950\text{mV}$), the crystal runs fast, and `PPM=1414` setback (~5s/h) works well. At lower voltages ($< 3950\text{mV}$), the hardware oscillator naturally slows down (~15s/h slow). Continuing to apply a 5s/h setback added unnecessary reverse lag (leading to +21s/h lag).
+   - **Implementation**: The RTC drift logic dynamically reads `$RUNTIME_DIR/battery.volt` and suppresses setback (`EFFECTIVE_PPM=0`) below 3950mV.
+
+4. **Continuous Physical Voltage Telemetry & IPC**:
+   - **Rationale**: Enables battery health tracking and exports voltage state across subshells.
+   - **Implementation**: Logs physical millivolts at startup and hourly sampling windows (e.g. `battery refresh sample: old=85 new=85 (4052mV)`) and records to `$RUNTIME_DIR/battery.volt`.
 
 ## What changed in 2.5.0
 
@@ -125,7 +145,7 @@ Logs:
 
 - Designed for the Kindle 4 Non-Touch 600×800 framebuffer and its physical key codes.
 - RTC low-power phase scheduling requires `/sys/devices/platform/mxc_rtc.0/wakeup_enable` and the adjacent `rtc_pmic_epoch_time`; when unavailable, the clock remains awake and uses the system clock for scheduling.
-- Battery reading depends on the Kindle 4 `gasgauge-info -c` output.
+- Battery estimation prioritizes physical voltage piecewise interpolation (`gasgauge-info -v` / sysfs) calibrated against real-device discharge curves, falling back to `gasgauge-info -c`; other Kindle models may have different voltage sysfs paths and discharge curves.
 - Lunar dates are supported from 1900 through 2100.
 - Seconds and per-second updates are intentionally omitted.
 - Minute changes use direct refreshes and do not include a flip animation.

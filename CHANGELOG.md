@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.1 - 2026-09-25
+
+### Added
+
+- Physical battery voltage sampling (`gasgauge-info -v` and sysfs fallback) with runtime IPC export (`battery.volt`) and millivolt telemetry in runtime logs
+- Empirical non-linear voltage-to-percentage piecewise estimation model (`calc_battery_from_voltage()`) calibrated against actual Kindle 4 discharge telemetry (4120mV down to 3420mV)
+
+### Changed
+
+- Battery percentage calculation in `get_battery_level()` now prioritizes physical voltage over the distorted Kindle 4 fuel gauge coulomb counter (`gasgauge-info -c`)
+- RTC suspend wall-clock drift compensation dynamically adapts to battery voltage: setback (`PPM`) is automatically suppressed when battery voltage is below 3950mV, preventing reverse clock lag caused by crystal oscillator slowdown under low voltage
+
+### Fixed
+
+- Hourly automatic SNTP time synchronization interval check: added a 300-second (5-minute) tolerance margin to prevent Wi-Fi handshake and NTP network latency (~7-10s) from skipping the next hourly interval check
+- Migrated settings version check in `tests/test_refresh_timing.sh` to match schema version 5
+
 ## 2.5.0 - 2026-08-27
 
 ### Added
