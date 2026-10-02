@@ -35,7 +35,9 @@ TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=0
 AUTO_TIME_CHECK_HOURLY=0
+AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
+ADAPTIVE_PPM_TRIM=0
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
@@ -44,7 +46,7 @@ BATTERY_REFRESH_SETTLE_SECONDS=25
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
-CURRENT_SETTINGS_VERSION=5
+CURRENT_SETTINGS_VERSION=6
 SETTINGS_MIGRATED=0
 DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
@@ -133,6 +135,9 @@ load_settings() {
       AUTO_TIME_SYNC_INTERVAL_HOURS=0
       RTC_DRIFT_COMPENSATION_PPM=5400
     fi
+    if [ "$SETTINGS_VERSION" -lt 6 ]; then
+      AUTO_DRIFT_CALIBRATION=1
+    fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
   fi
@@ -149,6 +154,7 @@ load_settings() {
   is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=25
   case "$DEBUG_LOG" in 0|1) ;; *) DEBUG_LOG=0 ;; esac
   case "$AUTO_TIME_CHECK_HOURLY" in 0|1) ;; *) AUTO_TIME_CHECK_HOURLY=0 ;; esac
+  case "$AUTO_DRIFT_CALIBRATION" in 0|1) ;; *) AUTO_DRIFT_CALIBRATION=1 ;; esac
   is_uint "$LOG_MAX_BYTES" || LOG_MAX_BYTES=4194304
   [ "$TIME_SYNC_TIMEOUT" -lt 10 ] && TIME_SYNC_TIMEOUT=10
   [ "$TIME_SYNC_TIMEOUT" -gt 180 ] && TIME_SYNC_TIMEOUT=180
@@ -182,6 +188,7 @@ save_settings() {
     echo "NTP_SERVERS=\"$NTP_SERVERS\""
     echo "AUTO_TIME_SYNC_INTERVAL_HOURS=$AUTO_TIME_SYNC_INTERVAL_HOURS"
     echo "AUTO_TIME_CHECK_HOURLY=$AUTO_TIME_CHECK_HOURLY"
+    echo "AUTO_DRIFT_CALIBRATION=$AUTO_DRIFT_CALIBRATION"
     echo "RTC_DRIFT_COMPENSATION_PPM=$RTC_DRIFT_COMPENSATION_PPM"
     echo "IDLE_SUSPEND_SECONDS=$IDLE_SUSPEND_SECONDS"
     echo "RTC_WAKE_LEAD_SECONDS=$RTC_WAKE_LEAD_SECONDS"
@@ -389,21 +396,74 @@ calc_battery_from_voltage() {
 calc_effective_ppm() {
   V="$1"
   BASE_PPM="$2"
+  TRIM="${3:-0}"
   is_uint "$BASE_PPM" || BASE_PPM=0
   [ "$BASE_PPM" -le 0 ] && { echo 0; return 0; }
   is_uint "$V" || { echo "$BASE_PPM"; return 0; }
+  is_uint "${TRIM#-}" || TRIM=0
 
   # Kindle 4 crystal oscillator drift scales strongly with supply voltage:
   # - High voltage (>= 4050mV): raw crystal runs fast by ~18.5s/h -> full BASE_PPM (~5400)
   # - Transition zone (3950mV - 4050mV): drift linearly reduces to 0 around 3950mV
   # - Low voltage (< 3950mV): raw crystal runs neutral/slow -> suppress setback (PPM=0)
   if [ "$V" -ge 4050 ]; then
-    echo "$BASE_PPM"
+    EFF_PPM=$(( BASE_PPM + TRIM ))
   elif [ "$V" -ge 3950 ]; then
-    echo $(( BASE_PPM * (V - 3950) / 100 ))
+    VOLT_BASE=$(( BASE_PPM * (V - 3950) / 100 ))
+    EFF_PPM=$(( VOLT_BASE + TRIM ))
   else
-    echo 0
+    if [ "$TRIM" -gt 0 ]; then
+      EFF_PPM="$TRIM"
+    else
+      EFF_PPM=0
+    fi
   fi
+  [ "$EFF_PPM" -lt 0 ] && EFF_PPM=0
+  [ "$EFF_PPM" -gt 8000 ] && EFF_PPM=8000
+  echo "$EFF_PPM"
+}
+
+update_adaptive_drift_trim() {
+  [ "$AUTO_DRIFT_CALIBRATION" = "1" ] || return 0
+  SYNC_STAT_FILE="$RUNTIME_DIR/last_sntp_sync"
+  [ -f "$SYNC_STAT_FILE" ] || return 0
+
+  OFFSET_MS=""
+  ELAPSED_SEC=""
+  DRIFT_PPM=""
+  while IFS='=' read -r key val; do
+    case "$key" in
+      OFFSET_MS) OFFSET_MS="$val" ;;
+      ELAPSED_SEC) ELAPSED_SEC="$val" ;;
+      DRIFT_PPM) DRIFT_PPM="$val" ;;
+    esac
+  done < "$SYNC_STAT_FILE"
+  rm -f "$SYNC_STAT_FILE"
+
+  is_uint "$ELAPSED_SEC" || return 0
+  [ "$ELAPSED_SEC" -ge 1800 ] && [ "$ELAPSED_SEC" -le 10800 ] || return 0
+
+  is_uint "${OFFSET_MS#-}" || return 0
+  ABS_OFFSET_MS="${OFFSET_MS#-}"
+  [ "$ABS_OFFSET_MS" -le 60000 ] || return 0
+
+  is_uint "${DRIFT_PPM#-}" || return 0
+
+  # Damping factor 0.5 to prevent hunting / oscillation
+  ADAPT_STEP=$(( DRIFT_PPM / 2 ))
+  [ "$ADAPT_STEP" -gt 1500 ] && ADAPT_STEP=1500
+  [ "$ADAPT_STEP" -lt -1500 ] && ADAPT_STEP=-1500
+
+  is_uint "${ADAPTIVE_PPM_TRIM#-}" || ADAPTIVE_PPM_TRIM=0
+  ADAPTIVE_PPM_TRIM=$(( ADAPTIVE_PPM_TRIM + ADAPT_STEP ))
+  [ "$ADAPTIVE_PPM_TRIM" -gt 3000 ] && ADAPTIVE_PPM_TRIM=3000
+  [ "$ADAPTIVE_PPM_TRIM" -lt -3000 ] && ADAPTIVE_PPM_TRIM=-3000
+
+  echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
+  CURRENT_VOLT=""
+  [ -f "$RUNTIME_DIR/battery.volt" ] && CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
+  NEXT_EFF_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
+  log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
 }
 
 get_battery_level() {
@@ -1102,8 +1162,13 @@ try_rtc_suspend() {
 
     # Calculate exact drift accrued during actual sleep time and set back system clock
     ACTUAL_SLEPT_SECONDS=$((RESUME_SYSTEM - SUSPEND_START_SYSTEM))
-    CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
-    EFFECTIVE_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM")
+    CURRENT_VOLT=""
+    [ -f "$RUNTIME_DIR/battery.volt" ] && CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
+    if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
+      TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
+      is_uint "${TRIM_VAL#-}" && ADAPTIVE_PPM_TRIM="$TRIM_VAL"
+    fi
+    EFFECTIVE_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
     if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$EFFECTIVE_PPM" && [ "$EFFECTIVE_PPM" -gt 0 ]; then
       is_uint "$DRIFT_REMAINDER_MS" || DRIFT_REMAINDER_MS=0
       REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * EFFECTIVE_PPM * 1000) / (1000000 + EFFECTIVE_PPM) ))
@@ -1339,8 +1404,12 @@ main() {
     "$RENDER_REQUEST_FIFO" "$PARTIAL_DISABLED_FILE" \
     "$RUNTIME_DIR"/render-status-*
   load_settings
+  if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
+    TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
+    is_uint "${TRIM_VAL#-}" && ADAPTIVE_PPM_TRIM="$TRIM_VAL"
+  fi
   start_new_session_log
-  log_message "startup: active settings: ppm=$RTC_DRIFT_COMPENSATION_PPM auto_check=$AUTO_TIME_CHECK_HOURLY auto_sync_interval=$AUTO_TIME_SYNC_INTERVAL_HOURS idle_suspend=${IDLE_SUSPEND_SECONDS}s wake_lead=${RTC_WAKE_LEAD_SECONDS}s settle=${BATTERY_REFRESH_SETTLE_SECONDS}s"
+  log_message "startup: active settings: ppm=$RTC_DRIFT_COMPENSATION_PPM auto_check=$AUTO_TIME_CHECK_HOURLY auto_sync_interval=$AUTO_TIME_SYNC_INTERVAL_HOURS idle_suspend=${IDLE_SUSPEND_SECONDS}s wake_lead=${RTC_WAKE_LEAD_SECONDS}s settle=${BATTERY_REFRESH_SETTLE_SECONDS}s auto_drift=$AUTO_DRIFT_CALIBRATION trim=${ADAPTIVE_PPM_TRIM}ppm"
   ORIGINAL_WIFI_STATE=$(wifi_get_enabled)
   case "$ORIGINAL_WIFI_STATE" in 0|1) ;; *) ORIGINAL_WIFI_STATE="" ;; esac
   log_message "startup: original Wi-Fi state=${ORIGINAL_WIFI_STATE:-unknown}"
@@ -1349,6 +1418,7 @@ main() {
   if time_sync_now; then
     log_message "startup time synchronization succeeded"
     LAST_AUTO_SYNC_EPOCH=$(date +%s)
+    update_adaptive_drift_trim
   else
     log_message "startup time synchronization failed; continuing with system time"
     LAST_AUTO_SYNC_EPOCH=0
@@ -1419,6 +1489,7 @@ main() {
         if finish_time_sync; then
           log_message "time synchronization succeeded"
           LAST_AUTO_SYNC_EPOCH=$(date +%s)
+          update_adaptive_drift_trim
           cancel_next_frame_render
           initialize_virtual_clock
           if render_current_frame; then
@@ -1445,6 +1516,7 @@ main() {
             if is_uint "$AUTO_SYNC_COMPLETED_EPOCH" && [ "$AUTO_SYNC_COMPLETED_EPOCH" -gt 0 ]; then
               LAST_AUTO_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
             fi
+            update_adaptive_drift_trim
             initialize_virtual_clock
           fi
           prepare_next_minute "$FRESH_BATTERY_LEVEL"

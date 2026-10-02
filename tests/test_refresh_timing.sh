@@ -8,12 +8,14 @@ eval "$DEFINITIONS"
 
 monotonic_centiseconds >/dev/null
 
+log_message() { :; }
 save_settings() { :; }
 SETTINGS_VERSION=3
 RTC_WAKE_LEAD_SECONDS=2
 load_settings
-[ "$SETTINGS_VERSION" = 5 ]
+[ "$SETTINGS_VERSION" = 6 ]
 [ "$RTC_WAKE_LEAD_SECONDS" = 3 ]
+[ "$AUTO_DRIFT_CALIBRATION" = 1 ]
 
 NEXT_FRAME_EPOCH=120
 NEXT_DISPLAY_CLOCK=120
@@ -56,5 +58,31 @@ parse_partial_detail "170 612 260 178 DIGITS 1 START_CS 5058 END_CS 5133"
 [ "$(calc_effective_ppm 3950 5400)" = "0" ]
 [ "$(calc_effective_ppm 3800 5400)" = "0" ]
 [ "$(calc_effective_ppm 4120 0)" = "0" ]
+
+[ "$(calc_effective_ppm 4120 5400 300)" = "5700" ]
+[ "$(calc_effective_ppm 4120 5400 -500)" = "4900" ]
+[ "$(calc_effective_ppm 4000 5400 300)" = "3000" ]
+[ "$(calc_effective_ppm 3800 5400 250)" = "250" ]
+[ "$(calc_effective_ppm 3800 5400 -250)" = "0" ]
+[ "$(calc_effective_ppm 4120 5400 3000)" = "8000" ]
+[ "$(calc_effective_ppm 4120 5400 -6000)" = "0" ]
+
+# Test update_adaptive_drift_trim
+RUNTIME_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'kfc')
+AUTO_DRIFT_CALIBRATION=1
+ADAPTIVE_PPM_TRIM=0
+SYNC_STAT_FILE="$RUNTIME_DIR/last_sntp_sync"
+printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "250" ]
+[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "250" ]
+[ ! -f "$SYNC_STAT_FILE" ]
+
+printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=400\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "450" ]
+[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "450" ]
+
+rm -rf "$RUNTIME_DIR"
 
 printf 'refresh timing tests passed\n'

@@ -2,13 +2,30 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.5.2** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.5.3** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.5.3 的主要修改（闭环动态自适应 PPM 晶振漂移校准）
+
+针对不同个体的硬件晶振离散度、环境温漂及器件老化，在 2.5.2 开环前馈电压分段补偿的基础上，引入了**基于整点 NTP 实测偏差的闭环自适应学习算法**（`AUTO_DRIFT_CALIBRATION=1`）：
+
+1. **基于上一次测得时间的闭环动态 PPM 修正**
+   - **修改理由**：尽管 2.5.2 已经建立了针对供电电压的基准 PPM 补偿曲线（5400 PPM），但不同台 Kindle 硬件晶振的初始频偏存在个体离散度（±5~10 PPM），且室内环境温度变化（如昼夜温差）和晶体老化也会带来持续性频移。如果仅使用固定的前馈查表，长期运行后仍会累积数秒偏差。
+   - **技术实现**：
+     - `sntp.lua` 在每次成功联网校时时，精确记录与上一次校准间隔时长 $T_{\text{elapsed}}$ 以及本次测得的残留时钟偏差 $\Delta t$，计算上一周期的实际漂移率 $\Delta \text{PPM} = \frac{-\Delta t}{T_{\text{elapsed}}} \times 10^6$，并导出至运行时状态文件 `/tmp/kfc/last_sntp_sync`。
+     - `start.sh` 在每次成功同步后读取该残留频偏，采用带阻尼的学习算法（学习因子 $\alpha = 0.5$），计算本轮调节步进 $\text{Step} = \Delta \text{PPM} / 2$（单次步进限制在 $\pm 1500\text{PPM}$ 以内，防止网络抖动引起超调振荡）。
+     - 将累积积分微调值 $\text{Trim}$（范围限制在 $[-3000, +3000]\text{PPM}$）叠加到当前电压前馈基准上：
+       $$\text{Effective PPM} = \text{clamp}(\text{Base}(V) + \text{Trim}, 0, 8000)$$
+     - 每次休眠恢复时实时计算生效 PPM，彻底实现每台设备自适应微调至 0 误差运行。
+2. **容错机制与离线稳态保持**
+   - 仅在校时间隔介于 30 分钟至 3 小时之间（$1800\text{s} \le T_{\text{elapsed}} \le 10800\text{s}$）且实测偏差在合理范围（$|\Delta t| \le 60\text{s}$）内才触发学习，过滤异常网络响应。
+   - 当遇到 Wi-Fi 连接失败、网络超时或处于离线模式时，系统自动保持上一轮已收敛的微调值，不退化、不丢失已学到的晶振特性。
+   - 配置文件升级为 `SETTINGS_VERSION=6`，默认开启 `AUTO_DRIFT_CALIBRATION=1`。
 
 ## 2.5.2 的主要修改（实测 PPM 曲线优化与低电防掉电保护）
 
@@ -153,7 +170,7 @@
 配置文件位于 `kfc/settings.conf`：
 
 ```sh
-SETTINGS_VERSION=5
+SETTINGS_VERSION=6
 ORIENTATION=landscape_left
 HOUR_MODE=24
 THEME=dark
@@ -163,6 +180,7 @@ NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=1
 AUTO_TIME_CHECK_HOURLY=0
 RTC_DRIFT_COMPENSATION_PPM=5400
+AUTO_DRIFT_CALIBRATION=1
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
@@ -182,7 +200,8 @@ LOG_MAX_BYTES=4194304
 - `NTP_SERVERS`：NTP 服务器列表，默认使用三个阿里云公网地址
 - `AUTO_TIME_SYNC_INTERVAL_HOURS`：距离上次成功校时至少经过多少小时才再次自动校时；`0` 禁用，允许 0–72
 - `AUTO_TIME_CHECK_HOURLY`：`1` 在未执行自动校时的整点被动检测 NTP 偏差；不会设置系统时间
-- `RTC_DRIFT_COMPENSATION_PPM`：休眠恢复后的系统时钟漂移补偿，`0` 禁用
+- `RTC_DRIFT_COMPENSATION_PPM`：休眠恢复后的系统时钟基准漂移补偿，默认 5400，`0` 禁用
+- `AUTO_DRIFT_CALIBRATION`：`1` 启用基于整点 NTP 实测偏差的闭环自适应晶振漂移校准；`0` 仅使用静态电压前馈曲线
 - `IDLE_SUSPEND_SECONDS`：最后一次实体键后保持清醒的秒数，默认 15，允许 5–3600
 - `RTC_WAKE_LEAD_SECONDS`：分钟边界前提前唤醒的秒数，默认 3，允许 1–10
 - `PARTIAL_REFRESH_DURATION_MS`：普通分钟刷新预计可见耗时，默认 800 毫秒，允许 100–5000

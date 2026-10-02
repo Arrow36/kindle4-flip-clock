@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.3 - 2026-10-02
+
+### Added
+
+- Closed-loop adaptive crystal drift calibration (`AUTO_DRIFT_CALIBRATION=1`, enabled by default):
+  - Automatically measures residual time offset $\Delta t$ and elapsed interval $T_{\text{elapsed}}$ against NTP during hourly syncs (`sntp.lua` exports `/tmp/kfc/last_sntp_sync`)
+  - Calculates residual drift error rate: $\Delta \text{PPM} = \frac{-\Delta t}{T_{\text{elapsed}}} \times 10^6$
+  - Applies damped integral feedback trim ($\alpha = 0.5$, $\text{step} = \Delta \text{PPM} / 2$, clamped to $\pm 1500$ PPM/hr) to smoothly calibrate individual crystal variations across temperature and hardware aging without hunting or overshoot
+  - Dynamically combines feedforward voltage scaling with closed-loop trim: $\text{Effective PPM} = \text{clamp}(\text{Base}(V) + \text{Trim}, 0, 8000)$
+  - Restricts calibration to reliable time intervals ($1800\text{s} \le T_{\text{elapsed}} \le 10800\text{s}$, $|\Delta t| \le 60\text{s}$) and bounds total trim to $[-3000, +3000]$ PPM
+  - Persists learned trim across suspends via `/tmp/kfc/adaptive_ppm.trim` and automatically preserves the last converged value when offline or when Wi-Fi is unavailable
+- Comprehensive unit test coverage in `tests/test_refresh_timing.sh` for adaptive PPM trim, damping calculations, bounds clamping, and schema version 6 migration
+
+### Changed
+
+- Bumped settings schema to version 6 with `AUTO_DRIFT_CALIBRATION=1` in `kfc/settings.conf` and automatic migration for existing configurations
+
 ## 2.5.2 - 2026-10-02
 
 ### Changed

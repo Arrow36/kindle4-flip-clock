@@ -2,13 +2,30 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.2** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.3** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.3 (Closed-loop adaptive PPM drift calibration)
+
+To address individual crystal variations, ambient temperature fluctuations, and crystal aging, this release introduces **closed-loop adaptive learning based on measured NTP offsets** (`AUTO_DRIFT_CALIBRATION=1`) on top of 2.5.2's feedforward voltage curve:
+
+1. **Closed-Loop Dynamic PPM Drift Calibration**:
+   - **Rationale**: While 2.5.2 provided an accurate voltage-based baseline curve (5400 PPM), individual 32.768kHz crystals exhibit manufacturing tolerances ($\pm 5\sim 10\text{ PPM}$), and ambient room temperature swings (day/night) cause persistent frequency drift. A purely static feedforward lookup would still accumulate drift over weeks of operation.
+   - **Implementation**:
+     - `sntp.lua` records the elapsed interval $T_{\text{elapsed}}$ and measured residual offset $\Delta t$ at each successful sync, computes the actual drift rate $\Delta \text{PPM} = \frac{-\Delta t}{T_{\text{elapsed}}} \times 10^6$, and writes it to `/tmp/kfc/last_sntp_sync`.
+     - `start.sh` calculates a damped adjustment step ($\alpha = 0.5$, $\text{Step} = \Delta \text{PPM} / 2$, clamped to $\pm 1500\text{ PPM/hr}$) to calibrate smoothly without overshooting or hunting.
+     - Adds accumulated integral trim $\text{Trim}$ ($[-3000, +3000]\text{ PPM}$) onto the feedforward baseline:
+       $$\text{Effective PPM} = \text{clamp}(\text{Base}(V) + \text{Trim}, 0, 8000)$$
+     - Recalculates effective PPM on each resume from RTC suspend, achieving per-device zero-drift operation.
+2. **Robust Bounds and Offline Stability**:
+   - Updates only when sync intervals are between 30 minutes and 3 hours ($1800\text{s} \le T_{\text{elapsed}} \le 10800\text{s}$) with sane offsets ($|\Delta t| \le 60\text{s}$).
+   - If Wi-Fi fails or the device is offline, the last converged trim value is maintained without loss or degradation.
+   - Settings schema upgraded to `SETTINGS_VERSION=6` with `AUTO_DRIFT_CALIBRATION=1` enabled by default.
 
 ## What changed in 2.5.2 (PPM curve optimization & brownout protection)
 
@@ -121,7 +138,7 @@ The directional pad and right next-page key are currently unassigned.
 `kfc/settings.conf` contains:
 
 ```sh
-SETTINGS_VERSION=5
+SETTINGS_VERSION=6
 ORIENTATION=landscape_left
 HOUR_MODE=24
 THEME=dark
@@ -131,6 +148,7 @@ NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=1
 AUTO_TIME_CHECK_HOURLY=0
 RTC_DRIFT_COMPENSATION_PPM=5400
+AUTO_DRIFT_CALIBRATION=1
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
@@ -140,7 +158,7 @@ DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
 ```
 
-`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `AUTO_TIME_SYNC_INTERVAL_HOURS` accepts 0–72 (`0` disables it), `AUTO_TIME_CHECK_HOURLY=1` enables passive checks, and `RTC_DRIFT_COMPENSATION_PPM=0` disables drift compensation. `IDLE_SUSPEND_SECONDS` accepts 5–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 0–50 seconds.
+`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `AUTO_TIME_SYNC_INTERVAL_HOURS` accepts 0–72 (`0` disables it), `AUTO_TIME_CHECK_HOURLY=1` enables passive checks, and `RTC_DRIFT_COMPENSATION_PPM=0` disables baseline drift compensation. `AUTO_DRIFT_CALIBRATION=1` enables closed-loop adaptive drift learning from hourly NTP offsets (`0` disables learning and uses static voltage scaling). `IDLE_SUSPEND_SECONDS` accepts 5–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 0–50 seconds.
 
 ## Rendering
 

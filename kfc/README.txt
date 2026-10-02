@@ -1,4 +1,4 @@
-kfc (Kindle Flip Clock) 2.5.2
+kfc (Kindle Flip Clock) 2.5.3
 
 Requirements:
 - jailbroken Kindle 4 Non-Touch
@@ -21,7 +21,9 @@ at the top of the hour to eliminate long-term clock drift. A 5-minute margin ens
 hourly synchronization does not skip intervals due to network latency, and low-battery
 protection skips Wi-Fi below 3550mV to prevent PMIC brownout.
 Hardware RTC oscillator drift is dynamically scaled across supply voltages
-(5400 PPM at >=4050mV, ramping to 0 at <=3950mV) via RTC_DRIFT_COMPENSATION_PPM.
+(5400 PPM at >=4050mV, ramping to 0 at <=3950mV) via RTC_DRIFT_COMPENSATION_PPM,
+and is dynamically fine-tuned using closed-loop learning from each hour's
+measured NTP offset via AUTO_DRIFT_CALIBRATION.
 
 Exit with the Home button.
 Press Back to clear the screen and force a complete redraw.

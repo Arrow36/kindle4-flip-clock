@@ -156,6 +156,8 @@ for _, server in ipairs(servers) do
     if result then
         local extra = ""
         local now_epoch = socket.gettime()
+        local elapsed_s = nil
+        local delta_s = nil
         local last_file = io.open(cache_path, "r")
         if last_file then
             local content = last_file:read("*a")
@@ -164,8 +166,8 @@ for _, server in ipairs(servers) do
             last_epoch = tonumber(last_epoch)
             last_offset = tonumber(last_offset)
             if last_epoch and last_offset and (now_epoch - last_epoch) > 5 then
-                local delta_s = result.offset - last_offset
-                local elapsed_s = now_epoch - last_epoch
+                delta_s = result.offset - last_offset
+                elapsed_s = now_epoch - last_epoch
                 local ppm = (delta_s / elapsed_s) * 1000000
                 extra = string.format(" (delta=%+.4fs in %.0fs, rate=%+.1f ppm)", delta_s, elapsed_s, ppm)
             end
@@ -176,6 +178,22 @@ for _, server in ipairs(servers) do
             local stored_offset = check_only and result.offset or 0.0
             write_file:write(string.format("%.4f %.6f\n", now_epoch, stored_offset))
             write_file:close()
+        end
+
+        if not check_only then
+            local sync_stat_path = "/tmp/kfc/last_sntp_sync"
+            local stat_file = io.open(sync_stat_path, "w")
+            if stat_file then
+                local offset_ms = math.floor(result.offset * 1000 + 0.5)
+                local elapsed = math.floor((elapsed_s or 0) + 0.5)
+                local drift_ppm = 0
+                if elapsed > 0 and delta_s then
+                    drift_ppm = math.floor((-delta_s / elapsed) * 1000000 + 0.5)
+                end
+                stat_file:write(string.format("OFFSET_MS=%d\nELAPSED_SEC=%d\nDRIFT_PPM=%d\n",
+                    offset_ms, elapsed, drift_ppm))
+                stat_file:close()
+            end
         end
 
         sntp_log(string.format(
