@@ -2,13 +2,29 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.1** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.2** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.2 (PPM curve optimization & brownout protection)
+
+Based on a complete 150-hour (6.21-day) empirical discharge test, this release fine-tunes crystal oscillator drift compensation across voltages and adds low-battery shutdown prevention:
+
+1. **Piecewise Continuous Voltage-Scaled PPM Drift Compensation**:
+   - **Rationale**: Telemetry revealed the 32.768kHz crystal runs fast by ~18.5s/h at high battery voltage ($\ge 4050\text{mV}$). The legacy default of `PPM=1414` only set back ~4.8s/h, leaving ~13.7s/h fast drift. Across the transition zone ($3950 \sim 4050\text{mV}$), drift reduces linearly to 0s/h at ~3960mV before crystal inversion.
+   - **Implementation**: Added `calc_effective_ppm()` and raised the reference default from 1414 to **5400**:
+     - $\ge 4050\text{mV}$: Full baseline PPM (5400, compensating ~18.3s/h fast drift, minimizing error to $\pm 1\text{s}$)
+     - $3950\text{mV} \sim 4050\text{mV}$: Linearly ramps from 0 to full PPM (e.g., 2700 PPM at 4000mV, compensating ~9.1s/h drift)
+     - $< 3950\text{mV}$: Completely suppressed (`EFFECTIVE_PPM=0`) to avoid compounding low-voltage crystal lag
+     - Custom `RTC_DRIFT_COMPENSATION_PPM` in `settings.conf` scales proportionately.
+
+2. **Low-Battery Wi-Fi Inrush Protection (Brownout Prevention)**:
+   - **Rationale**: In real-world battery exhaustion tests, initiating Wi-Fi at 3432mV (3%) drew a 200–300mA inrush current spike that caused cell voltage sag to breach the PMIC low-voltage cutoff, causing an abrupt brownout.
+   - **Implementation**: Hourly auto-sync now inspects cell voltage; if $< 3550\text{mV}$ (~7% battery), it skips Wi-Fi activation and relies on local RTC suspend, allowing the device to safely drain its remaining capacity.
 
 ## What changed in 2.5.1 (Field-tested fixes & optimizations)
 
@@ -114,7 +130,7 @@ TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=1
 AUTO_TIME_CHECK_HOURLY=0
-RTC_DRIFT_COMPENSATION_PPM=1414
+RTC_DRIFT_COMPENSATION_PPM=5400
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800

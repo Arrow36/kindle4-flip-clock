@@ -35,7 +35,7 @@ TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=0
 AUTO_TIME_CHECK_HOURLY=0
-RTC_DRIFT_COMPENSATION_PPM=1414
+RTC_DRIFT_COMPENSATION_PPM=5400
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
@@ -131,7 +131,7 @@ load_settings() {
       RTC_WAKE_LEAD_SECONDS=3
       BATTERY_REFRESH_SETTLE_SECONDS=25
       AUTO_TIME_SYNC_INTERVAL_HOURS=0
-      RTC_DRIFT_COMPENSATION_PPM=1414
+      RTC_DRIFT_COMPENSATION_PPM=5400
     fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
@@ -381,6 +381,26 @@ calc_battery_from_voltage() {
     echo $(( 5 + (V - 3520) * 10 / 100 ))
   elif [ "$V" -ge 3420 ]; then
     echo $(( 1 + (V - 3420) * 4 / 100 ))
+  else
+    echo 0
+  fi
+}
+
+calc_effective_ppm() {
+  V="$1"
+  BASE_PPM="$2"
+  is_uint "$BASE_PPM" || BASE_PPM=0
+  [ "$BASE_PPM" -le 0 ] && { echo 0; return 0; }
+  is_uint "$V" || { echo "$BASE_PPM"; return 0; }
+
+  # Kindle 4 crystal oscillator drift scales strongly with supply voltage:
+  # - High voltage (>= 4050mV): raw crystal runs fast by ~18.5s/h -> full BASE_PPM (~5400)
+  # - Transition zone (3950mV - 4050mV): drift linearly reduces to 0 around 3950mV
+  # - Low voltage (< 3950mV): raw crystal runs neutral/slow -> suppress setback (PPM=0)
+  if [ "$V" -ge 4050 ]; then
+    echo "$BASE_PPM"
+  elif [ "$V" -ge 3950 ]; then
+    echo $(( BASE_PPM * (V - 3950) / 100 ))
   else
     echo 0
   fi
@@ -969,7 +989,12 @@ refresh_battery_sample_after_hourly_full_refresh() {
     if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || \
        [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ] || \
        [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
-      AUTO_SYNC_DUE=1
+      CURRENT_SYNC_VOLT=$(get_battery_voltage)
+      if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
+        log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
+      else
+        AUTO_SYNC_DUE=1
+      fi
     fi
   fi
   if [ "$AUTO_SYNC_DUE" = "1" ]; then
@@ -982,10 +1007,15 @@ refresh_battery_sample_after_hourly_full_refresh() {
     ) &
     NTP_SYNC_PID=$!
   elif [ "$AUTO_TIME_CHECK_HOURLY" = "1" ] && [ -z "$SYNC_PID" ]; then
-    (
-      time_sync_now "check_only"
-    ) &
-    NTP_SYNC_PID=$!
+    CURRENT_SYNC_VOLT=$(get_battery_voltage)
+    if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
+      log_message "auto time check skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
+    else
+      (
+        time_sync_now "check_only"
+      ) &
+      NTP_SYNC_PID=$!
+    fi
   fi
 
   if [ "$BATTERY_REFRESH_SETTLE_SECONDS" -le 0 ]; then
@@ -1073,10 +1103,7 @@ try_rtc_suspend() {
     # Calculate exact drift accrued during actual sleep time and set back system clock
     ACTUAL_SLEPT_SECONDS=$((RESUME_SYSTEM - SUSPEND_START_SYSTEM))
     CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
-    EFFECTIVE_PPM="$RTC_DRIFT_COMPENSATION_PPM"
-    if is_uint "$CURRENT_VOLT" && [ "$CURRENT_VOLT" -lt 3950 ]; then
-      EFFECTIVE_PPM=0
-    fi
+    EFFECTIVE_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM")
     if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$EFFECTIVE_PPM" && [ "$EFFECTIVE_PPM" -gt 0 ]; then
       is_uint "$DRIFT_REMAINDER_MS" || DRIFT_REMAINDER_MS=0
       REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * EFFECTIVE_PPM * 1000) / (1000000 + EFFECTIVE_PPM) ))

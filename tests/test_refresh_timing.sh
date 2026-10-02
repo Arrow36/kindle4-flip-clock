@@ -49,4 +49,12 @@ parse_partial_detail "170 612 260 178 DIGITS 1 START_CS 5058 END_CS 5133"
 [ "$PARTIAL_START_CS" = 5058 ]
 [ "$PARTIAL_END_CS" = 5133 ]
 
+[ "$(calc_effective_ppm 4120 5400)" = "5400" ]
+[ "$(calc_effective_ppm 4050 5400)" = "5400" ]
+[ "$(calc_effective_ppm 4000 5400)" = "2700" ]
+[ "$(calc_effective_ppm 3975 5400)" = "1350" ]
+[ "$(calc_effective_ppm 3950 5400)" = "0" ]
+[ "$(calc_effective_ppm 3800 5400)" = "0" ]
+[ "$(calc_effective_ppm 4120 0)" = "0" ]
+
 printf 'refresh timing tests passed\n'

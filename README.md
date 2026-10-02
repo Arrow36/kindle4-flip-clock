@@ -2,13 +2,29 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.5.1** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.5.2** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.5.2 的主要修改（实测 PPM 曲线优化与低电防掉电保护）
+
+根据 150 小时（6.21 天）的实机全周期放电日志，重点对不同电压阶段的硬件晶振频偏补偿和低电量运行稳定性进行了深度优化：
+
+1. **电压分段连续线性 PPM 补偿（消除高压段残留走快）**
+   - **修改理由**：实测表明，在高电压阶段（$\ge 4050\text{mV}$），Kindle 4 硬件 32.768kHz 晶振走快约 18.5 秒/小时。原默认值 `PPM=1414` 仅扣减约 4.8 秒/小时，仍残留约 13.7 秒/小时的快漂；在过渡区间（$3950 \sim 4050\text{mV}$），走快速率随电压下降线性收敛至 0 秒/小时（4000mV 处约为 8.2 秒/小时）；低于 3950mV 后晶振反转走慢。
+   - **技术实现**：新增 `calc_effective_ppm()` 线性分段插值函数，并将基准 PPM 默认值从 1414 升级至 **5400**：
+     - $\ge 4050\text{mV}$：满额生效基准 PPM（5400，对应扣减 ~18.3s/h，将高压段时钟漂移压缩至 ±1s 级别）
+     - $3950\text{mV} \sim 4050\text{mV}$：100mV 跨度内线性递减至 0（例如 4000mV 处生效 2700 PPM，抵消 ~9.1s/h 漂移）
+     - $< 3950\text{mV}$：100% 抑制回拨补偿（`EFFECTIVE_PPM=0`），避免加剧硬件走慢
+     - 支持在 `settings.conf` 中自定义基础 PPM，函数按同等比例动态缩放。
+
+2. **新增低电压自动跳过 Wi-Fi 保护（防止低电脉冲瞬断）**
+   - **修改理由**：在实机放电截止测试中，当电池降至 3432mV（3%）极低状态时，整点自动校时开启 Wi-Fi 射频模块产生的 200~300mA 脉冲电流导致电池端电压瞬间跌落（Voltage Sag），触碰了 PMIC 低压关机保护阈值（Brownout）。
+   - **技术实现**：在每小时自动校时与偏差检测中增加电压判定。当检测到物理电压低于 3550mV（约剩余 7% 电量）时，自动跳过 Wi-Fi 开启和网络同步，由本地 RTC 继续走时，避免 Wi-Fi 瞬态电流导致提前掉电，保障设备平稳耗尽剩余电量。
 
 ## 2.5.1 的主要修改（实测优化与 Bug 修复）
 
@@ -146,7 +162,7 @@ TIME_SYNC_TIMEOUT=45
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
 AUTO_TIME_SYNC_INTERVAL_HOURS=1
 AUTO_TIME_CHECK_HOURLY=0
-RTC_DRIFT_COMPENSATION_PPM=1414
+RTC_DRIFT_COMPENSATION_PPM=5400
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800

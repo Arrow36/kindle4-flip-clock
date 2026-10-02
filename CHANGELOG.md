@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.2 - 2026-10-02
+
+### Changed
+
+- Updated default `RTC_DRIFT_COMPENSATION_PPM` from 1414 to 5400 based on 150-hour empirical discharge telemetry, perfectly counteracting ~18.5s/h fast crystal drift at high battery voltage (>=4050mV)
+- Implemented `calc_effective_ppm()` continuous piecewise linear scaling for RTC drift compensation:
+  - $\ge 4050\text{mV}$: 100% of base PPM (5400 PPM, compensating ~18.3s/h fast drift)
+  - $3950\text{mV} \sim 4050\text{mV}$: linear ramp down to 0 PPM across the 100mV transition zone (e.g. 2700 PPM at 4000mV, matching ~8.2s/h drift)
+  - $< 3950\text{mV}$: completely suppressed (0 PPM) to avoid compounding crystal lag
+- Added low-battery Wi-Fi protection in hourly auto-sync: skips Wi-Fi initiation when battery voltage is below 3550mV (~7%), preventing 200-300mA inrush current spikes from triggering PMIC brownout shutdowns and allowing the device to run on local RTC down to empty
+
+### Added
+
+- Unit test coverage in `tests/test_refresh_timing.sh` for `calc_effective_ppm()` voltage interpolation
+
 ## 2.5.1 - 2026-09-25
 
 ### Added
