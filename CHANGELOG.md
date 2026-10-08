@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.4 - 2026-10-08
+
+Based on the complete 137-hour 2.5.3 discharge log (96 successful hourly syncs).
+
+### Changed
+
+- Removed the voltage-scaled PPM curve introduced in 2.5.2. The log showed the suspend/resume drift switching abruptly between regimes (about -13 s/h to +22 s/h before compensation), including fast drift of ~20 s/h at 3700-3567 mV where the curve applied no correction. Regime changes coincided with shifts in the `rtc_late` wake distribution, not with voltage
+- Effective PPM is now `RTC_DRIFT_COMPENSATION_PPM + learned trim`, clamped to `[-8000, +12000]`. Negative values move the clock forward after each suspend, so a slow regime can be corrected
+- Adaptive calibration keeps the 0.5 damping but allows steps up to ±6000 PPM per sync and limits the trim to the range the effective PPM can actually use (anti-windup). Replaying the 2.5.3 log, this controller gives a mean hourly error of about 5.0 s/h versus 8.5 s/h measured with 2.5.3
+- Calibration accepts sync intervals up to 4 hours and offsets up to 120 s, and ignores residuals above 20000 PPM
+
+### Added
+
+- `calc_drift_adjustment()` helper with signed millisecond carry, plus unit tests for forward correction, anti-windup and sample rejection
+
 ## 2.5.3 - 2026-10-02
 
 ### Added

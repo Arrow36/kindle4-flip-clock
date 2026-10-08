@@ -2,13 +2,29 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.3** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.4** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.4 (Voltage-independent closed-loop drift model & signed PPM)
+
+Based on a complete 137-hour empirical discharge run (96 successful hourly syncs), this release completely decouples drift correction from battery voltage and redesigns the closed-loop controller:
+
+1. **Removed Voltage-Scaled PPM Lookup Curve**:
+   - **Rationale**: Reconstructed uncompensated crystal drift showed that drift regimes (switching between -13 s/h and +22 s/h) do not correlate with battery voltage (even at 3700~3567mV, the clock ran fast by ~20 s/h, where 2.5.2 suppressed compensation to 0). Drift regime transitions coincided with integer-second truncation shifts in `rtc_late`, not cell voltage.
+   - **Implementation**: The feedforward voltage curve is replaced by a fixed baseline estimate (default 5400 PPM), with the closed-loop learner directly tracking the active regime.
+
+2. **Signed PPM Compensation (Forward Clock Adjustments for Slow Regimes)**:
+   - **Rationale**: During real-world testing, the device entered an extended slow regime (~-10 s/h). Because previous versions enforced `EFFECTIVE_PPM >= 0` (setback only), no compensation could be applied to a slow clock.
+   - **Implementation**: Effective PPM range expanded to `[-8000, +12000] PPM`. Added `calc_drift_adjustment()` helper with signed millisecond remainder carry. When effective PPM is negative, the clock is adjusted forward after suspend.
+
+3. **Anti-Windup Bounds and Wider Learning Steps**:
+   - **Rationale**: Legacy trim limits ($\pm 3000$) and step caps (1500 PPM) caused the integrator to take hours to reach target values during regime changes, while risking integral windup in uncorrectable directions.
+   - **Implementation**: Step cap increased to 6000 PPM, and trim range dynamically matches the effective PPM limits (`TRIM_MAX = DRIFT_PPM_MAX - BASE_PPM`, `TRIM_MIN = DRIFT_PPM_MIN - BASE_PPM`). In offline trace replay, this reduced mean absolute hourly error from 8.5 s/h to 5.0 s/h.
 
 ## What changed in 2.5.3 (Closed-loop adaptive PPM drift calibration)
 
@@ -158,7 +174,7 @@ DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
 ```
 
-`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `AUTO_TIME_SYNC_INTERVAL_HOURS` accepts 0–72 (`0` disables it), `AUTO_TIME_CHECK_HOURLY=1` enables passive checks, and `RTC_DRIFT_COMPENSATION_PPM=0` disables baseline drift compensation. `AUTO_DRIFT_CALIBRATION=1` enables closed-loop adaptive drift learning from hourly NTP offsets (`0` disables learning and uses static voltage scaling). `IDLE_SUSPEND_SECONDS` accepts 5–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 0–50 seconds.
+`TIMEZONE` uses POSIX TZ syntax. Note that the sign is reversed compared with the usual UTC notation; UTC+8 is written as `CST-8`. `TIME_SYNC_TIMEOUT` accepts 10–180 seconds. `AUTO_TIME_SYNC_INTERVAL_HOURS` accepts 0–72 (`0` disables it), `AUTO_TIME_CHECK_HOURLY=1` enables passive checks, and `RTC_DRIFT_COMPENSATION_PPM=0` disables all drift compensation. `AUTO_DRIFT_CALIBRATION=1` enables closed-loop adaptive drift learning from hourly NTP offsets (tracking both fast and slow regimes); `0` uses only the static baseline estimate. `IDLE_SUSPEND_SECONDS` accepts 5–3600 seconds, `RTC_WAKE_LEAD_SECONDS` accepts 1–10 seconds, both fixed refresh-duration estimates accept 100–5000 milliseconds, and `BATTERY_REFRESH_SETTLE_SECONDS` accepts 0–50 seconds.
 
 ## Rendering
 

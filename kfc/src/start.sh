@@ -38,6 +38,9 @@ AUTO_TIME_CHECK_HOURLY=0
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
 ADAPTIVE_PPM_TRIM=0
+# Effective drift compensation bounds (negative = move the clock forward).
+DRIFT_PPM_MIN=-8000
+DRIFT_PPM_MAX=12000
 IDLE_SUSPEND_SECONDS=15
 RTC_WAKE_LEAD_SECONDS=3
 PARTIAL_REFRESH_DURATION_MS=800
@@ -394,32 +397,21 @@ calc_battery_from_voltage() {
 }
 
 calc_effective_ppm() {
-  V="$1"
+  # $1 (battery voltage) is accepted for call compatibility but no longer used:
+  # the 137-hour 2.5.3 run showed the suspend/resume drift switching between
+  # regimes (about -13 to +22 s/h) independently of voltage, so the voltage
+  # curve introduced in 2.5.2 is replaced by the closed-loop estimate.
   BASE_PPM="$2"
   TRIM="${3:-0}"
   is_uint "$BASE_PPM" || BASE_PPM=0
   [ "$BASE_PPM" -le 0 ] && { echo 0; return 0; }
-  is_uint "$V" || { echo "$BASE_PPM"; return 0; }
   is_uint "${TRIM#-}" || TRIM=0
 
-  # Kindle 4 crystal oscillator drift scales strongly with supply voltage:
-  # - High voltage (>= 4050mV): raw crystal runs fast by ~18.5s/h -> full BASE_PPM (~5400)
-  # - Transition zone (3950mV - 4050mV): drift linearly reduces to 0 around 3950mV
-  # - Low voltage (< 3950mV): raw crystal runs neutral/slow -> suppress setback (PPM=0)
-  if [ "$V" -ge 4050 ]; then
-    EFF_PPM=$(( BASE_PPM + TRIM ))
-  elif [ "$V" -ge 3950 ]; then
-    VOLT_BASE=$(( BASE_PPM * (V - 3950) / 100 ))
-    EFF_PPM=$(( VOLT_BASE + TRIM ))
-  else
-    if [ "$TRIM" -gt 0 ]; then
-      EFF_PPM="$TRIM"
-    else
-      EFF_PPM=0
-    fi
-  fi
-  [ "$EFF_PPM" -lt 0 ] && EFF_PPM=0
-  [ "$EFF_PPM" -gt 8000 ] && EFF_PPM=8000
+  # Positive values set the clock back after suspend; negative values move it
+  # forward (the slow regime).
+  EFF_PPM=$(( BASE_PPM + TRIM ))
+  [ "$EFF_PPM" -lt "$DRIFT_PPM_MIN" ] && EFF_PPM="$DRIFT_PPM_MIN"
+  [ "$EFF_PPM" -gt "$DRIFT_PPM_MAX" ] && EFF_PPM="$DRIFT_PPM_MAX"
   echo "$EFF_PPM"
 }
 
@@ -441,29 +433,54 @@ update_adaptive_drift_trim() {
   rm -f "$SYNC_STAT_FILE"
 
   is_uint "$ELAPSED_SEC" || return 0
-  [ "$ELAPSED_SEC" -ge 1800 ] && [ "$ELAPSED_SEC" -le 10800 ] || return 0
+  [ "$ELAPSED_SEC" -ge 1800 ] && [ "$ELAPSED_SEC" -le 14400 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
-  ABS_OFFSET_MS="${OFFSET_MS#-}"
-  [ "$ABS_OFFSET_MS" -le 60000 ] || return 0
+  [ "${OFFSET_MS#-}" -le 120000 ] || return 0
 
+  # DRIFT_PPM is the residual rate observed while the previous effective PPM
+  # was active: positive means the clock still ran fast.
   is_uint "${DRIFT_PPM#-}" || return 0
+  [ "${DRIFT_PPM#-}" -le 20000 ] || return 0
 
-  # Damping factor 0.5 to prevent hunting / oscillation
+  # Damping factor 0.5: the best of the controllers replayed against the
+  # 2.5.3 log (mean hourly error 5.0 s/h versus 8.5 s/h in that run).
   ADAPT_STEP=$(( DRIFT_PPM / 2 ))
-  [ "$ADAPT_STEP" -gt 1500 ] && ADAPT_STEP=1500
-  [ "$ADAPT_STEP" -lt -1500 ] && ADAPT_STEP=-1500
+  [ "$ADAPT_STEP" -gt 6000 ] && ADAPT_STEP=6000
+  [ "$ADAPT_STEP" -lt -6000 ] && ADAPT_STEP=-6000
 
   is_uint "${ADAPTIVE_PPM_TRIM#-}" || ADAPTIVE_PPM_TRIM=0
   ADAPTIVE_PPM_TRIM=$(( ADAPTIVE_PPM_TRIM + ADAPT_STEP ))
-  [ "$ADAPTIVE_PPM_TRIM" -gt 3000 ] && ADAPTIVE_PPM_TRIM=3000
-  [ "$ADAPTIVE_PPM_TRIM" -lt -3000 ] && ADAPTIVE_PPM_TRIM=-3000
+  # Anti-windup: keep the trim inside the range the effective PPM can use.
+  TRIM_MAX=$(( DRIFT_PPM_MAX - RTC_DRIFT_COMPENSATION_PPM ))
+  TRIM_MIN=$(( DRIFT_PPM_MIN - RTC_DRIFT_COMPENSATION_PPM ))
+  [ "$ADAPTIVE_PPM_TRIM" -gt "$TRIM_MAX" ] && ADAPTIVE_PPM_TRIM="$TRIM_MAX"
+  [ "$ADAPTIVE_PPM_TRIM" -lt "$TRIM_MIN" ] && ADAPTIVE_PPM_TRIM="$TRIM_MIN"
 
   echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
-  CURRENT_VOLT=""
-  [ -f "$RUNTIME_DIR/battery.volt" ] && CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
-  NEXT_EFF_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
+  NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
   log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
+}
+
+# Sets DRIFT_ADJUST_SECONDS to the signed whole-second correction to add to
+# the system clock after sleeping $1 seconds at $2 PPM (negative result =
+# set back, positive = move forward). Sub-second parts carry over in
+# DRIFT_REMAINDER_MS, which keeps the sign of the accumulated correction.
+calc_drift_adjustment() {
+  ADJ_SLEPT="$1"
+  ADJ_PPM="$2"
+  DRIFT_ADJUST_SECONDS=0
+  is_uint "$ADJ_SLEPT" || return 1
+  is_uint "${ADJ_PPM#-}" || return 1
+  [ "$ADJ_PPM" -ne 0 ] || return 1
+  is_uint "${DRIFT_REMAINDER_MS#-}" || DRIFT_REMAINDER_MS=0
+  # Shell arithmetic truncates toward zero, so positive and negative PPM
+  # behave symmetrically and % keeps the dividend's sign.
+  ADJ_MS=$(( (ADJ_SLEPT * ADJ_PPM * 1000) / (1000000 + ADJ_PPM) ))
+  ADJ_TOTAL_MS=$(( ADJ_MS + DRIFT_REMAINDER_MS ))
+  DRIFT_REMAINDER_MS=$(( ADJ_TOTAL_MS % 1000 ))
+  DRIFT_ADJUST_SECONDS=$(( -(ADJ_TOTAL_MS / 1000) ))
+  return 0
 }
 
 get_battery_level() {
@@ -1169,15 +1186,13 @@ try_rtc_suspend() {
       is_uint "${TRIM_VAL#-}" && ADAPTIVE_PPM_TRIM="$TRIM_VAL"
     fi
     EFFECTIVE_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
-    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && is_uint "$EFFECTIVE_PPM" && [ "$EFFECTIVE_PPM" -gt 0 ]; then
-      is_uint "$DRIFT_REMAINDER_MS" || DRIFT_REMAINDER_MS=0
-      REDUCTION_MS=$(( (ACTUAL_SLEPT_SECONDS * EFFECTIVE_PPM * 1000) / (1000000 + EFFECTIVE_PPM) ))
-      TOTAL_REDUCTION_MS=$(( REDUCTION_MS + DRIFT_REMAINDER_MS ))
-      REDUCTION_SECONDS=$(( TOTAL_REDUCTION_MS / 1000 ))
-      DRIFT_REMAINDER_MS=$(( TOTAL_REDUCTION_MS % 1000 ))
-      if [ "$REDUCTION_SECONDS" -gt 0 ]; then
-        adjust_system_time "-$REDUCTION_SECONDS"
-        log_message "drift clock adjust: setback ${REDUCTION_SECONDS}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
+    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ] && calc_drift_adjustment "$ACTUAL_SLEPT_SECONDS" "$EFFECTIVE_PPM"; then
+      if [ "$DRIFT_ADJUST_SECONDS" -lt 0 ]; then
+        adjust_system_time "$DRIFT_ADJUST_SECONDS"
+        log_message "drift clock adjust: setback ${DRIFT_ADJUST_SECONDS#-}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
+      elif [ "$DRIFT_ADJUST_SECONDS" -gt 0 ]; then
+        adjust_system_time "$DRIFT_ADJUST_SECONDS"
+        log_message "drift clock adjust: forward ${DRIFT_ADJUST_SECONDS}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
       fi
     fi
   fi

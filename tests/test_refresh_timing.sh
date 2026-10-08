@@ -51,25 +51,35 @@ parse_partial_detail "170 612 260 178 DIGITS 1 START_CS 5058 END_CS 5133"
 [ "$PARTIAL_START_CS" = 5058 ]
 [ "$PARTIAL_END_CS" = 5133 ]
 
+# Effective PPM no longer depends on voltage; trim may drive it negative.
 [ "$(calc_effective_ppm 4120 5400)" = "5400" ]
-[ "$(calc_effective_ppm 4050 5400)" = "5400" ]
-[ "$(calc_effective_ppm 4000 5400)" = "2700" ]
-[ "$(calc_effective_ppm 3975 5400)" = "1350" ]
-[ "$(calc_effective_ppm 3950 5400)" = "0" ]
-[ "$(calc_effective_ppm 3800 5400)" = "0" ]
+[ "$(calc_effective_ppm 3800 5400)" = "5400" ]
+[ "$(calc_effective_ppm "" 5400)" = "5400" ]
 [ "$(calc_effective_ppm 4120 0)" = "0" ]
+[ "$(calc_effective_ppm 4120 0 3000)" = "0" ]
+[ "$(calc_effective_ppm 3800 5400 300)" = "5700" ]
+[ "$(calc_effective_ppm 3800 5400 -9000)" = "-3600" ]
+[ "$(calc_effective_ppm 4120 5400 9000)" = "12000" ]
+[ "$(calc_effective_ppm 4120 5400 -20000)" = "-8000" ]
 
-[ "$(calc_effective_ppm 4120 5400 300)" = "5700" ]
-[ "$(calc_effective_ppm 4120 5400 -500)" = "4900" ]
-[ "$(calc_effective_ppm 4000 5400 300)" = "3000" ]
-[ "$(calc_effective_ppm 3800 5400 250)" = "250" ]
-[ "$(calc_effective_ppm 3800 5400 -250)" = "0" ]
-[ "$(calc_effective_ppm 4120 5400 3000)" = "8000" ]
-[ "$(calc_effective_ppm 4120 5400 -6000)" = "0" ]
+# Signed drift adjustment with millisecond carry.
+DRIFT_REMAINDER_MS=0
+for _ in 1 2 3; do calc_drift_adjustment 57 5400; [ "$DRIFT_ADJUST_SECONDS" = 0 ]; done
+[ "$DRIFT_REMAINDER_MS" = 918 ]
+calc_drift_adjustment 57 5400
+[ "$DRIFT_ADJUST_SECONDS" = -1 ]
+[ "$DRIFT_REMAINDER_MS" = 224 ]
+DRIFT_REMAINDER_MS=0
+for _ in 1 2 3 4; do calc_drift_adjustment 57 -3600; [ "$DRIFT_ADJUST_SECONDS" = 0 ]; done
+calc_drift_adjustment 57 -3600
+[ "$DRIFT_ADJUST_SECONDS" = 1 ]
+[ "$DRIFT_REMAINDER_MS" = -25 ]
+if calc_drift_adjustment 57 0; then exit 1; fi
 
 # Test update_adaptive_drift_trim
 RUNTIME_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'kfc')
 AUTO_DRIFT_CALIBRATION=1
+RTC_DRIFT_COMPENSATION_PPM=5400
 ADAPTIVE_PPM_TRIM=0
 SYNC_STAT_FILE="$RUNTIME_DIR/last_sntp_sync"
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
@@ -81,7 +91,27 @@ update_adaptive_drift_trim
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=400\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "450" ]
-[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "450" ]
+
+# Large slow residual: step capped at 6000, trim may push PPM negative.
+printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-5550" ]
+[ "$(calc_effective_ppm "" 5400 "$ADAPTIVE_PPM_TRIM")" = "-150" ]
+
+# Anti-windup: trim stops where the effective PPM reaches -8000.
+for _ in 1 2 3; do
+  printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
+  update_adaptive_drift_trim
+done
+[ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
+
+# Implausible samples are ignored.
+printf "OFFSET_MS=-90000\nELAPSED_SEC=3600\nDRIFT_PPM=25000\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
+printf "OFFSET_MS=-9000\nELAPSED_SEC=20000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
 
 rm -rf "$RUNTIME_DIR"
 
