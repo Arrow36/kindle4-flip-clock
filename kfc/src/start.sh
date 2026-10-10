@@ -24,6 +24,7 @@ AUTO_SYNC_RESULT_TMP="$RUNTIME_DIR/auto_sync.result.tmp"
 RENDER_REQUEST_FIFO="$RUNTIME_DIR/render.request"
 RENDER_SERVER_PID_FILE="$RUNTIME_DIR/render_server.pid"
 PARTIAL_DISABLED_FILE="$RUNTIME_DIR/partial.disabled"
+TRIM_PERSIST_FILE="$BASE_DIR/learned_ppm.trim"
 RTC_PATH="/sys/devices/platform/mxc_rtc.0/wakeup_enable"
 RTC_PMIC_EPOCH_PATH="/sys/devices/platform/mxc_rtc.0/rtc_pmic_epoch_time"
 POWER_STATE_PATH="/sys/power/state"
@@ -47,6 +48,7 @@ PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
 BATTERY_REFRESH_SETTLE_SECONDS=25
 LAST_AUTO_SYNC_EPOCH=0
+LAST_SYNC_EPOCH=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
 CURRENT_SETTINGS_VERSION=6
@@ -433,7 +435,7 @@ update_adaptive_drift_trim() {
   rm -f "$SYNC_STAT_FILE"
 
   is_uint "$ELAPSED_SEC" || return 0
-  [ "$ELAPSED_SEC" -ge 1800 ] && [ "$ELAPSED_SEC" -le 14400 ] || return 0
+  [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 14400 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
   [ "${OFFSET_MS#-}" -le 120000 ] || return 0
@@ -443,11 +445,21 @@ update_adaptive_drift_trim() {
   is_uint "${DRIFT_PPM#-}" || return 0
   [ "${DRIFT_PPM#-}" -le 20000 ] || return 0
 
-  # Damping factor 0.5: the best of the controllers replayed against the
-  # 2.5.3 log (mean hourly error 5.0 s/h versus 8.5 s/h in that run).
-  ADAPT_STEP=$(( DRIFT_PPM / 2 ))
-  [ "$ADAPT_STEP" -gt 6000 ] && ADAPT_STEP=6000
-  [ "$ADAPT_STEP" -lt -6000 ] && ADAPT_STEP=-6000
+  # Dynamic damping factor:
+  # - Cold start or severe regime shifts (|DRIFT_PPM| >= 3000): aggressive 80% step
+  #   to converge rapidly in 1-2 hours instead of 5-6 hours.
+  # - Transition zone (1500 <= |DRIFT_PPM| < 3000): 60% step.
+  # - Steady state (|DRIFT_PPM| < 1500): 50% critical damping to filter noise/jitter.
+  ABS_DRIFT_PPM="${DRIFT_PPM#-}"
+  if [ "$ABS_DRIFT_PPM" -ge 3000 ]; then
+    ADAPT_STEP=$(( DRIFT_PPM * 4 / 5 ))
+  elif [ "$ABS_DRIFT_PPM" -ge 1500 ]; then
+    ADAPT_STEP=$(( DRIFT_PPM * 3 / 5 ))
+  else
+    ADAPT_STEP=$(( DRIFT_PPM / 2 ))
+  fi
+  [ "$ADAPT_STEP" -gt 10000 ] && ADAPT_STEP=10000
+  [ "$ADAPT_STEP" -lt -10000 ] && ADAPT_STEP=-10000
 
   is_uint "${ADAPTIVE_PPM_TRIM#-}" || ADAPTIVE_PPM_TRIM=0
   ADAPTIVE_PPM_TRIM=$(( ADAPTIVE_PPM_TRIM + ADAPT_STEP ))
@@ -458,8 +470,28 @@ update_adaptive_drift_trim() {
   [ "$ADAPTIVE_PPM_TRIM" -lt "$TRIM_MIN" ] && ADAPTIVE_PPM_TRIM="$TRIM_MIN"
 
   echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
+  [ -n "$TRIM_PERSIST_FILE" ] && echo "$ADAPTIVE_PPM_TRIM" > "$TRIM_PERSIST_FILE" 2>/dev/null
   NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
   log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
+}
+
+restore_persistent_adaptive_trim() {
+  [ "$AUTO_DRIFT_CALIBRATION" = "1" ] || return 0
+  if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
+    TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
+    if is_uint "${TRIM_VAL#-}"; then
+      ADAPTIVE_PPM_TRIM="$TRIM_VAL"
+      return 0
+    fi
+  fi
+  if [ -n "$TRIM_PERSIST_FILE" ] && [ -r "$TRIM_PERSIST_FILE" ]; then
+    TRIM_VAL=$(cat "$TRIM_PERSIST_FILE" 2>/dev/null)
+    if is_uint "${TRIM_VAL#-}"; then
+      ADAPTIVE_PPM_TRIM="$TRIM_VAL"
+      echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null
+      log_message "restored persistent adaptive drift trim: ${ADAPTIVE_PPM_TRIM}ppm"
+    fi
+  fi
 }
 
 # Sets DRIFT_ADJUST_SECONDS to the signed whole-second correction to add to
@@ -1059,18 +1091,34 @@ refresh_battery_sample_after_hourly_full_refresh() {
   NTP_SYNC_PID=""
   AUTO_SYNC_DUE=0
   AUTO_SYNC_NOW=$(scheduler_now 2>/dev/null)
-  is_uint "$AUTO_SYNC_NOW" || AUTO_SYNC_NOW=0
+  is_uint "$AUTO_SYNC_NOW" && [ "$AUTO_SYNC_NOW" -gt 0 ] || AUTO_SYNC_NOW=$(date +%s)
   if [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -gt 0 ] && [ -z "$SYNC_PID" ]; then
-    AUTO_SYNC_THRESHOLD_SECONDS=$(( AUTO_TIME_SYNC_INTERVAL_HOURS * 3600 - 300 ))
-    [ "$AUTO_SYNC_THRESHOLD_SECONDS" -lt 1800 ] && AUTO_SYNC_THRESHOLD_SECONDS=1800
-    if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || \
-       [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ] || \
-       [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
-      CURRENT_SYNC_VOLT=$(get_battery_voltage)
-      if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
-        log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
+    COOLDOWN_ACTIVE=0
+    if [ "$LAST_SYNC_EPOCH" -gt 0 ] && [ "$AUTO_SYNC_NOW" -ge "$LAST_SYNC_EPOCH" ] && \
+       [ $((AUTO_SYNC_NOW - LAST_SYNC_EPOCH)) -lt 300 ]; then
+      COOLDOWN_ACTIVE=1
+    fi
+    if [ "$COOLDOWN_ACTIVE" = "0" ]; then
+      INTERVAL_DUE=0
+      if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -eq 1 ]; then
+        # First top-of-the-hour after startup, or hourly sync interval: always due at :00
+        INTERVAL_DUE=1
+      elif [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ]; then
+        INTERVAL_DUE=1
       else
-        AUTO_SYNC_DUE=1
+        AUTO_SYNC_THRESHOLD_SECONDS=$(( AUTO_TIME_SYNC_INTERVAL_HOURS * 3600 - 300 ))
+        [ "$AUTO_SYNC_THRESHOLD_SECONDS" -lt 1800 ] && AUTO_SYNC_THRESHOLD_SECONDS=1800
+        if [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
+          INTERVAL_DUE=1
+        fi
+      fi
+      if [ "$INTERVAL_DUE" = "1" ]; then
+        CURRENT_SYNC_VOLT=$(get_battery_voltage)
+        if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
+          log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
+        else
+          AUTO_SYNC_DUE=1
+        fi
       fi
     fi
   fi
@@ -1419,10 +1467,7 @@ main() {
     "$RENDER_REQUEST_FIFO" "$PARTIAL_DISABLED_FILE" \
     "$RUNTIME_DIR"/render-status-*
   load_settings
-  if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
-    TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
-    is_uint "${TRIM_VAL#-}" && ADAPTIVE_PPM_TRIM="$TRIM_VAL"
-  fi
+  restore_persistent_adaptive_trim
   start_new_session_log
   log_message "startup: active settings: ppm=$RTC_DRIFT_COMPENSATION_PPM auto_check=$AUTO_TIME_CHECK_HOURLY auto_sync_interval=$AUTO_TIME_SYNC_INTERVAL_HOURS idle_suspend=${IDLE_SUSPEND_SECONDS}s wake_lead=${RTC_WAKE_LEAD_SECONDS}s settle=${BATTERY_REFRESH_SETTLE_SECONDS}s auto_drift=$AUTO_DRIFT_CALIBRATION trim=${ADAPTIVE_PPM_TRIM}ppm"
   ORIGINAL_WIFI_STATE=$(wifi_get_enabled)
@@ -1432,10 +1477,12 @@ main() {
   log_message "startup time synchronization requested"
   if time_sync_now; then
     log_message "startup time synchronization succeeded"
-    LAST_AUTO_SYNC_EPOCH=$(date +%s)
+    LAST_SYNC_EPOCH=$(date +%s)
+    LAST_AUTO_SYNC_EPOCH=0
     update_adaptive_drift_trim
   else
     log_message "startup time synchronization failed; continuing with system time"
+    LAST_SYNC_EPOCH=0
     LAST_AUTO_SYNC_EPOCH=0
   fi
   # time_sync_now normally turns Wi-Fi off itself. Enforce the requested
@@ -1503,7 +1550,7 @@ main() {
       sync)
         if finish_time_sync; then
           log_message "time synchronization succeeded"
-          LAST_AUTO_SYNC_EPOCH=$(date +%s)
+          LAST_SYNC_EPOCH=$(date +%s)
           update_adaptive_drift_trim
           cancel_next_frame_render
           initialize_virtual_clock
@@ -1530,6 +1577,7 @@ main() {
             rm -f "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP"
             if is_uint "$AUTO_SYNC_COMPLETED_EPOCH" && [ "$AUTO_SYNC_COMPLETED_EPOCH" -gt 0 ]; then
               LAST_AUTO_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
+              LAST_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
             fi
             update_adaptive_drift_trim
             initialize_virtual_clock

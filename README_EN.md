@@ -2,13 +2,32 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.4** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.5** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.5 (Forced top-of-the-hour sync, dynamic damping factor & persistent trim)
+
+Based on the 48.5-hour empirical run revealing cold-start startup gaps and convergence lag:
+
+1. **Forced Top-of-the-Hour Auto-Sync**:
+   - **Rationale**: Startup sync previously set `LAST_AUTO_SYNC_EPOCH`, causing the first top-of-the-hour (e.g. 19:00 after 18:27 boot) to be skipped because 55 minutes had not elapsed, running on the wrong drift baseline for 93 minutes.
+   - **Implementation**: Startup sync records its own cooldown timestamp (`LAST_SYNC_EPOCH`). The first `:00` after boot and every hourly sync with `AUTO_TIME_SYNC_INTERVAL_HOURS=1` is forced to trigger whenever 300 seconds have passed since boot or manual sync. Minimum calibration interval is also lowered to 600s (10 minutes) so the first top-of-the-hour immediately adapts.
+
+2. **Dynamic Damping Factor (Fast Cold-Start Convergence)**:
+   - **Rationale**: Fixed 0.5 damping required 5-6 hours to close a 10000+ PPM initial error gap.
+   - **Implementation**: Step scaling adapts dynamically:
+     - Large residuals ($|\Delta \text{PPM}| \ge 3000$): 80% step (`DRIFT_PPM * 4 / 5`, capped at 10000 PPM), converging in 1-2 hours instead of 5-6 hours.
+     - Transition zone ($1500 \le |\Delta \text{PPM}| < 3000$): 60% step (`DRIFT_PPM * 3 / 5`).
+     - Steady state ($|\Delta \text{PPM}| < 1500$): 50% critical damping (`DRIFT_PPM / 2`) to reject noise.
+
+3. **Persistent Learned Trim across Reboots**:
+   - **Rationale**: Storing trim in RAM (`/tmp`) lost learned calibration upon power-off or restart.
+   - **Implementation**: The converged trim is saved to flash (`learned_ppm.trim`) and automatically restored on startup, achieving steady-state accuracy from minute 1.
 
 ## What changed in 2.5.4 (Voltage-independent closed-loop drift model & signed PPM)
 

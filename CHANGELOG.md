@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.5 - 2026-10-10
+
+Based on the 48.5-hour 2.5.4 empirical test log (39 successful hourly syncs, 794 forward drift adjustments).
+
+### Changed
+
+- **Forced Top-of-the-Hour Auto-Sync**: Startup time synchronization now records its timestamp independently (`LAST_SYNC_EPOCH`) without setting `LAST_AUTO_SYNC_EPOCH`. The first top-of-the-hour (`:00`) after startup and every hourly sync with `AUTO_TIME_SYNC_INTERVAL_HOURS=1` is now guaranteed to trigger whenever 300 seconds have passed since startup or manual sync, eliminating the legacy 93-minute startup gap.
+- **Dynamic Damping Factor (Fast Cold-Start Convergence)**: Closed-loop adaptive calibration now adjusts step size based on residual drift rate:
+  - Aggressive zone ($|\Delta \text{PPM}| \ge 3000$): 80% step (`DRIFT_PPM * 4 / 5`, capped at 10000 PPM) to lock onto physical crystal drift within 1-2 hours instead of 5-6 hours.
+  - Transition zone ($1500 \le |\Delta \text{PPM}| < 3000$): 60% step (`DRIFT_PPM * 3 / 5`).
+  - Steady state ($|\Delta \text{PPM}| < 1500$): 50% critical damping (`DRIFT_PPM / 2`) to filter network and measurement noise.
+- **Wider Minimum Sample Window**: Minimum elapsed interval for calibration accepted down to 600 seconds (10 minutes, previously 1800s), enabling immediate drift learning on the first top-of-the-hour even when KFC starts 10-30 minutes before the hour.
+
+### Added
+
+- **Persistent Learned Trim**: Converged `ADAPTIVE_PPM_TRIM` is now automatically mirrored to flash (`learned_ppm.trim`) and restored upon KFC startup, allowing subsequent runs or reboot cycles to operate at steady-state precision from minute 1.
+
 ## 2.5.4 - 2026-10-08
 
 Based on the complete 137-hour 2.5.3 discharge log (96 successful hourly syncs).

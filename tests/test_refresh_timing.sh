@@ -78,6 +78,8 @@ if calc_drift_adjustment 57 0; then exit 1; fi
 
 # Test update_adaptive_drift_trim
 RUNTIME_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'kfc')
+BASE_DIR="$RUNTIME_DIR"
+TRIM_PERSIST_FILE="$BASE_DIR/learned_ppm.trim"
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
 ADAPTIVE_PPM_TRIM=0
@@ -86,32 +88,104 @@ printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "250" ]
 [ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "250" ]
+[ "$(cat "$TRIM_PERSIST_FILE")" = "250" ]
 [ ! -f "$SYNC_STAT_FILE" ]
 
+# Steady-state zone (< 1500 PPM): 50% critical damping
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=400\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "450" ]
 
-# Large slow residual: step capped at 6000, trim may push PPM negative.
+# Transition zone (1500 <= |PPM| < 3000): 60% step (2000 * 3 / 5 = 1200)
+printf "OFFSET_MS=-7200\nELAPSED_SEC=3600\nDRIFT_PPM=2000\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "1650" ]
+
+# Aggressive zone (|PPM| >= 3000): 80% step (-5000 * 4 / 5 = -4000)
+printf "OFFSET_MS=18000\nELAPSED_SEC=3600\nDRIFT_PPM=-5000\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-2350" ]
+
+# Large residual: step capped at 10000 PPM
 printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "-5550" ]
-[ "$(calc_effective_ppm "" 5400 "$ADAPTIVE_PPM_TRIM")" = "-150" ]
+[ "$ADAPTIVE_PPM_TRIM" = "-12350" ]
 
-# Anti-windup: trim stops where the effective PPM reaches -8000.
-for _ in 1 2 3; do
-  printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
-  update_adaptive_drift_trim
-done
+# Anti-windup: trim stops where effective PPM reaches -8000 (trim = -13400)
+printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
+[ "$(calc_effective_ppm "" 5400 "$ADAPTIVE_PPM_TRIM")" = "-8000" ]
+
+# Short elapsed interval accepted (>= 600s)
+printf "OFFSET_MS=1000\nELAPSED_SEC=900\nDRIFT_PPM=0\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ ! -f "$SYNC_STAT_FILE" ]
+
+# Too-short interval ignored (< 600s): trim is unchanged
+printf "OFFSET_MS=1000\nELAPSED_SEC=300\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
 
-# Implausible samples are ignored.
+# Test restore_persistent_adaptive_trim
+rm -f "$RUNTIME_DIR/adaptive_ppm.trim"
+ADAPTIVE_PPM_TRIM=0
+restore_persistent_adaptive_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
+[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "-13400" ]
+
+# Implausible samples are ignored
 printf "OFFSET_MS=-90000\nELAPSED_SEC=3600\nDRIFT_PPM=25000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
 printf "OFFSET_MS=-9000\nELAPSED_SEC=20000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
+
+# Test hourly auto-sync scheduling logic
+CURRENT_FRAME_EPOCH=3600
+AUTO_TIME_SYNC_INTERVAL_HOURS=1
+SYNC_PID=""
+CURRENT_FRAME_BATTERY=80
+AUTO_SYNC_RESULT_FILE="$RUNTIME_DIR/auto_sync.result"
+AUTO_SYNC_RESULT_TMP="$RUNTIME_DIR/auto_sync.result.tmp"
+get_battery_voltage() { echo 4000; }
+get_battery_level() { echo 80; }
+BATTERY_REFRESH_SETTLE_SECONDS=0
+
+# Mock scheduler_now to 19:00:00 (epoch 3600)
+scheduler_now() { echo 3600; }
+time_sync_now() { return 0; }
+
+# Case 1: First top-of-the-hour after startup (LAST_AUTO_SYNC_EPOCH=0, startup at 1620, elapsed=1980s >= 300s)
+LAST_AUTO_SYNC_EPOCH=0
+LAST_SYNC_EPOCH=1620
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
+
+# Case 2: Cooldown active (synced 100s ago at epoch 3500)
+LAST_SYNC_EPOCH=3500
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 0 ]
+
+# Case 3: Regular hourly sync (interval=1, last sync at epoch 0)
+LAST_AUTO_SYNC_EPOCH=0
+LAST_SYNC_EPOCH=0
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
+
+# Case 4: Interval=2, 1 hour later at 20:00 (not due)
+AUTO_TIME_SYNC_INTERVAL_HOURS=2
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_SYNC_EPOCH=3600
+scheduler_now() { echo 7200; }
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 0 ]
+
+# Case 5: Interval=2, 2 hours later at 21:00 (due)
+scheduler_now() { echo 10800; }
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
 
 rm -rf "$RUNTIME_DIR"
 
