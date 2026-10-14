@@ -13,9 +13,11 @@ save_settings() { :; }
 SETTINGS_VERSION=3
 RTC_WAKE_LEAD_SECONDS=2
 load_settings
-[ "$SETTINGS_VERSION" = 6 ]
-[ "$RTC_WAKE_LEAD_SECONDS" = 3 ]
+[ "$SETTINGS_VERSION" = 7 ]
+[ "$RTC_WAKE_LEAD_SECONDS" = 2 ]
 [ "$AUTO_DRIFT_CALIBRATION" = 1 ]
+[ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 0 ]
+[ "$BATTERY_REFRESH_SETTLE_SECONDS" = 0 ]
 
 NEXT_FRAME_EPOCH=120
 NEXT_DISPLAY_CLOCK=120
@@ -78,7 +80,13 @@ if calc_drift_adjustment 57 0; then exit 1; fi
 
 # Test update_adaptive_drift_trim
 RUNTIME_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'kfc')
+mkdir -p "$RUNTIME_DIR" /tmp/kfc
 BASE_DIR="$RUNTIME_DIR"
+LOG_DIR="$RUNTIME_DIR"
+LOG_FILE="$RUNTIME_DIR/kfc.log"
+SYNC_PID_FILE="$RUNTIME_DIR/time_sync.pid"
+SYNC_RESULT_FILE="$RUNTIME_DIR/time_sync.result"
+SYNC_RESULT_TMP="$RUNTIME_DIR/time_sync.result.tmp"
 TRIM_PERSIST_FILE="$BASE_DIR/learned_ppm.trim"
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
@@ -138,7 +146,7 @@ restore_persistent_adaptive_trim
 printf "OFFSET_MS=-90000\nELAPSED_SEC=3600\nDRIFT_PPM=25000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
-printf "OFFSET_MS=-9000\nELAPSED_SEC=20000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
+printf "OFFSET_MS=-9000\nELAPSED_SEC=30000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
 
@@ -160,17 +168,20 @@ time_sync_now() { return 0; }
 # Case 1: First top-of-the-hour after startup (LAST_AUTO_SYNC_EPOCH=0, startup at 1620, elapsed=1980s >= 300s)
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SYNC_EPOCH=1620
+SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
 # Case 2: Cooldown active (synced 100s ago at epoch 3500)
 LAST_SYNC_EPOCH=3500
+SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 0 ]
 
 # Case 3: Regular hourly sync (interval=1, last sync at epoch 0)
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SYNC_EPOCH=0
+SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
@@ -178,14 +189,57 @@ refresh_battery_sample_after_hourly_full_refresh >/dev/null
 AUTO_TIME_SYNC_INTERVAL_HOURS=2
 LAST_AUTO_SYNC_EPOCH=3600
 LAST_SYNC_EPOCH=3600
+SYNC_PID=""
 scheduler_now() { echo 7200; }
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 0 ]
 
 # Case 5: Interval=2, 2 hours later at 21:00 (due)
 scheduler_now() { echo 10800; }
+SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
+
+# Case 6: Default interval=4, 3 hours later at 22:00 (not due), 4 hours later at 23:00 (due)
+AUTO_TIME_SYNC_INTERVAL_HOURS=4
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_SYNC_EPOCH=3600
+scheduler_now() { echo 14400; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 0 ]
+scheduler_now() { echo 18000; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
+
+# Test low-voltage adaptive drift damping (< 3600mV clamped to +/-500)
+get_battery_voltage() { echo 3500; }
+printf "OFFSET_MS=-7200\nELAPSED_SEC=3600\nDRIFT_PPM=2000\n" > "$SYNC_STAT_FILE"
+ADAPTIVE_PPM_TRIM=0
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "500" ]
+
+# Test monotonic discharge filter (when not charging, sampled 85 > current 80 is capped to 80)
+get_battery_level() { echo 85; }
+get_battery_voltage() { echo 4000; }
+is_battery_charging() { return 1; }
+CURRENT_FRAME_BATTERY=80
+NEXT_FRAME_EPOCH=3600
+SYNC_PID=""
+cancel_next_frame_render
+start_next_frame_render
+[ "$NEXT_FRAME_BATTERY" = 80 ]
+
+# When charging, battery level can rise (sampled 85 is allowed)
+is_battery_charging() { return 0; }
+CURRENT_FRAME_BATTERY=80
+NEXT_FRAME_EPOCH=3600
+SYNC_PID=""
+cancel_next_frame_render
+start_next_frame_render
+[ "$NEXT_FRAME_BATTERY" = 85 ]
+cancel_next_frame_render
 
 rm -rf "$RUNTIME_DIR"
 

@@ -45,6 +45,13 @@ wifi_set_enabled() {
 wait_for_wifi() {
   WAITED=0
   while [ "$WAITED" -lt "$TIME_SYNC_TIMEOUT" ]; do
+    if [ "${SYNC_MODE:-}" = "auto" ]; then
+      CURRENT_SEC=$(( $(date +%s) % 60 ))
+      if [ "$CURRENT_SEC" -ge 38 ]; then
+        time_sync_log "Wi-Fi connection aborted: minute deadline reached (${CURRENT_SEC}s >= 38s)"
+        return 1
+      fi
+    fi
     WIFI_STATE=$(/usr/bin/lipc-get-prop com.lab126.wifid cmState 2>/dev/null)
     [ "$WIFI_STATE" = "CONNECTED" ] && return 0
     sleep 2
@@ -91,6 +98,15 @@ time_sync_now() {
   case "$WIFI_READY_TIME" in ''|*[!0-9]*) WIFI_READY_TIME="$SYNC_START_TIME" ;; esac
   WIFI_CONNECT_SEC=$(time_sync_elapsed_seconds "$SYNC_START_TIME" "$WIFI_READY_TIME")
   time_sync_log "Wi-Fi connected in ${WIFI_CONNECT_SEC}s"
+
+  if [ "$SYNC_MODE" = "auto" ]; then
+    CURRENT_SEC=$(( $(date +%s) % 60 ))
+    if [ "$CURRENT_SEC" -ge 40 ]; then
+      time_sync_log "auto sync aborted: minute deadline reached (${CURRENT_SEC}s >= 40s)"
+      wifi_set_enabled 0
+      return 1
+    fi
+  fi
 
   if [ "$SYNC_MODE" = "check_only" ]; then
     time_sync_log "checking NTP offset (passive monitor) with: $NTP_SERVERS"

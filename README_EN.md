@@ -2,13 +2,40 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.5** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.6** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.6 (Zero dropped frames, OCV battery sampling & doubled battery life)
+
+Based on 52.7 hours of empirical runtime telemetry (4,688 log lines):
+
+1. **Zero Dropped Frames & Non-blocking Hourly Sync**:
+   - **Rationale**: In previous releases, the main loop synchronously blocked on Wi-Fi sync during `:00`. When network latency exceeded 1 minute, the clock crossed `:01:00` and advanced the display target directly to `:02:00`, completely skipping `:01` (e.g. `18:01` and `21:01` were dropped entirely from display).
+   - **Implementation**:
+     - **Pre-render First**: Immediately dispatches the `XX:01` pre-render (~80ms) upon finishing the `XX:00` full refresh, ensuring digit cards are ready before Wi-Fi starts.
+     - **Asynchronous Sync**: Auto-sync runs in the background without blocking the main event scheduler.
+     - **Hard Minute Deadline**: Strict `:40` second deadline in `time_sync.sh` aborts sync and turns off Wi-Fi before reaching the minute boundary.
+     - **Smooth Re-anchor**: Synchronizing within the same minute updates scheduling without flashing the screen; cross-minute syncs immediately display the current minute rather than skipping ahead.
+
+2. **Open-Circuit Voltage (OCV) Battery Sampling & Eliminated `:01` Full Refresh**:
+   - **Rationale**: Concurrent Wi-Fi transmission drew 300mA pulses causing ~80mV transient IR drop, yielding erroneous battery percentages (e.g. 100% -> 92% -> 100%). Furthermore, updated battery levels forced a redundant full PNG refresh at `:01`, triggering a 2.7s latency spike at `:02`.
+   - **Implementation**:
+     - Samples quiet open-circuit voltage (OCV) upon waking from 53s deep sleep before enabling Wi-Fi or refreshing the screen, eliminating the redundant full refresh at `:01`.
+     - Set default `BATTERY_REFRESH_SETTLE_SECONDS` to `0`, saving 25 seconds of awake time every hour.
+     - Added monotonic discharge filter when not actively charging.
+
+3. **Eliminated 420ms / 1420ms Dual-Peak Latency**:
+   - Synchronized `NEXT_DISPLAY_CLOCK` and frame epochs with `DRIFT_ADJUST_SECONDS` during setback corrections, removing the 1000ms schedule offset artifact.
+
+4. **Substantially Extended Battery Life (~46h to 100-140+ Hours / 4-6 Days)**:
+   - Since `learned_ppm.trim` is fully converged and stored in flash, default `AUTO_TIME_SYNC_INTERVAL_HOURS` is increased from `1` to `4` (75% less Wi-Fi traffic).
+   - `TIME_SYNC_TIMEOUT` reduced to 20s; `RTC_WAKE_LEAD_SECONDS` tuned to 2s.
+   - Low-battery damping protects converged trim below 3600mV.
 
 ## What changed in 2.5.5 (Forced top-of-the-hour sync, dynamic damping factor & persistent trim)
 

@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.6 - 2026-10-14
+
+Based on 52.7-hour empirical runtime telemetry (4,688 lines in `kfc.log`).
+
+### Fixed
+
+- **Top-of-the-Hour Dropped / Skipped Frames**: Fixed `:01` minute dropping and skipping (`18:01` and `21:01` skipped completely in v2.5.5) caused by Wi-Fi synchronization blocking across the minute boundary:
+  - Immediately pre-renders the `XX:01` digit frame in background upon completing the `XX:00` full refresh, before Wi-Fi is turned on.
+  - Replaced synchronous `wait "$NTP_SYNC_PID"` in the main loop with asynchronous `start_time_sync "auto"`.
+  - Added a hard minute deadline in `time_sync.sh` (`current_sec >= 38` during connect, `>= 40` during sync): forces Wi-Fi to shut down and abort auto-sync before the minute boundary is ever reached.
+  - Fixed re-anchor jump: when auto-sync finishes within the same minute, aligns `NEXT_DISPLAY_CLOCK` smoothly without flashing the display; if a cross-minute sync occurs under extreme latency, immediately renders and displays the current minute instead of skipping ahead to the next.
+- **Battery IR Drop Distortion & Redundant `:01` Full Refresh**: Fixed battery bouncing (e.g. 100% -> 92% -> 100%) caused by sampling during Wi-Fi load drop:
+  - Sample quiet open-circuit voltage (OCV) immediately upon waking before the top-of-the-hour refresh, prior to enabling Wi-Fi or refreshing the display.
+  - Eliminated the redundant secondary full PNG refresh at `XX:01` (and the resulting 2.7s latency spike at `XX:02`), preserving partial DIGITS refresh for `XX:01`.
+  - Added monotonic discharge filter: when not actively charging, battery percentage is clamped to never increase due to temperature fluctuations.
+- **420ms / 1420ms Dual-Peak Refresh Latency**: Synchronized `NEXT_DISPLAY_CLOCK`, `NEXT_FRAME_EPOCH`, and `CURRENT_FRAME_EPOCH` with `DRIFT_ADJUST_SECONDS` when applying drift setback after suspend, eliminating the 1000ms schedule misalignment.
+
+### Changed
+
+- **Substantially Extended Battery Life (From ~46h to 100-140+ Hours / 4-6 Days)**:
+  - Increased default `AUTO_TIME_SYNC_INTERVAL_HOURS` from `1` to `4` (since learned trim is now permanently persisted and steady-state drift is $< 0.3\,\text{s/hr}$).
+  - Reduced `TIME_SYNC_TIMEOUT` from 45s to 20s.
+  - Set default `BATTERY_REFRESH_SETTLE_SECONDS` to `0` (eliminating 25s of awake idling every hour).
+  - Reduced default `RTC_WAKE_LEAD_SECONDS` from 3s to 2s.
+- **Adaptive Calibration Safeguards**:
+  - Added low-battery damping: clamps adaptive step to $\pm 500$ PPM when battery voltage $< 3600\text{mV}$ to prevent dying crystal slowdown from corrupting converged trim.
+  - Expanded accepted calibration interval `ELAPSED_SEC` up to 28800s (8 hours) to support multi-hour auto-sync intervals.
+  - Bumped settings schema to version 7 with automatic migration.
+
 ## 2.5.5 - 2026-10-10
 
 Based on the 48.5-hour 2.5.4 empirical test log (39 successful hourly syncs, 794 forward drift adjustments).

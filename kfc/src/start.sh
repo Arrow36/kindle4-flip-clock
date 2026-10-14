@@ -32,9 +32,9 @@ ORIENTATION=landscape_right
 HOUR_MODE=24
 THEME=light
 TIMEZONE=CST-8
-TIME_SYNC_TIMEOUT=45
+TIME_SYNC_TIMEOUT=20
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-AUTO_TIME_SYNC_INTERVAL_HOURS=0
+AUTO_TIME_SYNC_INTERVAL_HOURS=4
 AUTO_TIME_CHECK_HOURLY=0
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
@@ -43,15 +43,15 @@ ADAPTIVE_PPM_TRIM=0
 DRIFT_PPM_MIN=-8000
 DRIFT_PPM_MAX=12000
 IDLE_SUSPEND_SECONDS=15
-RTC_WAKE_LEAD_SECONDS=3
+RTC_WAKE_LEAD_SECONDS=2
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
-BATTERY_REFRESH_SETTLE_SECONDS=25
+BATTERY_REFRESH_SETTLE_SECONDS=0
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SYNC_EPOCH=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
-CURRENT_SETTINGS_VERSION=6
+CURRENT_SETTINGS_VERSION=7
 SETTINGS_MIGRATED=0
 DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
@@ -143,20 +143,26 @@ load_settings() {
     if [ "$SETTINGS_VERSION" -lt 6 ]; then
       AUTO_DRIFT_CALIBRATION=1
     fi
+    if [ "$SETTINGS_VERSION" -lt 7 ]; then
+      [ "$TIME_SYNC_TIMEOUT" = "45" ] && TIME_SYNC_TIMEOUT=20
+      [ "$BATTERY_REFRESH_SETTLE_SECONDS" = "25" ] && BATTERY_REFRESH_SETTLE_SECONDS=0
+      [ "$RTC_WAKE_LEAD_SECONDS" = "3" ] && RTC_WAKE_LEAD_SECONDS=2
+      [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = "1" ] && AUTO_TIME_SYNC_INTERVAL_HOURS=4
+    fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
   fi
   case "$ORIENTATION" in portrait|portrait_down|landscape_right|landscape_left) ;; *) ORIENTATION=landscape_right ;; esac
   case "$HOUR_MODE" in 12|24) ;; *) HOUR_MODE=24 ;; esac
   case "$THEME" in light|dark) ;; *) THEME=light ;; esac
-  is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=45
-  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=0
+  is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=20
+  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=4
   is_uint "$RTC_DRIFT_COMPENSATION_PPM" || RTC_DRIFT_COMPENSATION_PPM=0
   is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=15
-  is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=3
+  is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=2
   is_uint "$PARTIAL_REFRESH_DURATION_MS" || PARTIAL_REFRESH_DURATION_MS=800
   is_uint "$FULL_REFRESH_DURATION_MS" || FULL_REFRESH_DURATION_MS=1400
-  is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=25
+  is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=0
   case "$DEBUG_LOG" in 0|1) ;; *) DEBUG_LOG=0 ;; esac
   case "$AUTO_TIME_CHECK_HOURLY" in 0|1) ;; *) AUTO_TIME_CHECK_HOURLY=0 ;; esac
   case "$AUTO_DRIFT_CALIBRATION" in 0|1) ;; *) AUTO_DRIFT_CALIBRATION=1 ;; esac
@@ -214,7 +220,7 @@ cancel_next_frame_render() {
     if kill -0 "$NEXT_RENDER_PID" 2>/dev/null; then
       kill "$NEXT_RENDER_PID" 2>/dev/null
     fi
-    wait "$NEXT_RENDER_PID" 2>/dev/null
+    wait "$NEXT_RENDER_PID" 2>/dev/null || true
   fi
   NEXT_RENDER_PID=""
   NEXT_FRAME_READY=0
@@ -232,7 +238,7 @@ stop_render_server() {
     if kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
       kill "$RENDER_SERVER_PID" 2>/dev/null
     fi
-    wait "$RENDER_SERVER_PID" 2>/dev/null
+    wait "$RENDER_SERVER_PID" 2>/dev/null || true
   fi
   RENDER_SERVER_PID=""
   RENDER_SERVER_READY=0
@@ -346,7 +352,7 @@ cleanup() {
     if kill -0 "$SYNC_PID" 2>/dev/null; then
       kill "$SYNC_PID" 2>/dev/null
     fi
-    wait "$SYNC_PID" 2>/dev/null
+    wait "$SYNC_PID" 2>/dev/null || true
   fi
   SYNC_PID=""
 
@@ -435,7 +441,7 @@ update_adaptive_drift_trim() {
   rm -f "$SYNC_STAT_FILE"
 
   is_uint "$ELAPSED_SEC" || return 0
-  [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 14400 ] || return 0
+  [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 28800 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
   [ "${OFFSET_MS#-}" -le 120000 ] || return 0
@@ -460,6 +466,18 @@ update_adaptive_drift_trim() {
   fi
   [ "$ADAPT_STEP" -gt 10000 ] && ADAPT_STEP=10000
   [ "$ADAPT_STEP" -lt -10000 ] && ADAPT_STEP=-10000
+
+  CURRENT_VOLT=$(get_battery_voltage)
+  if is_uint "$CURRENT_VOLT" && [ "$CURRENT_VOLT" -lt 3600 ]; then
+    # Low-voltage regime damping: limit single-step trim adjustment to +/- 500 PPM
+    # to prevent low-voltage crystal frequency drop from poisoning converged trim
+    if [ "$ADAPT_STEP" -gt 500 ]; then
+      ADAPT_STEP=500
+    elif [ "$ADAPT_STEP" -lt -500 ]; then
+      ADAPT_STEP=-500
+    fi
+    log_message "adaptive drift trim: low battery damping (${CURRENT_VOLT}mV < 3600mV); step clamped to ${ADAPT_STEP}ppm"
+  fi
 
   is_uint "${ADAPTIVE_PPM_TRIM#-}" || ADAPTIVE_PPM_TRIM=0
   ADAPTIVE_PPM_TRIM=$(( ADAPTIVE_PPM_TRIM + ADAPT_STEP ))
@@ -513,6 +531,16 @@ calc_drift_adjustment() {
   DRIFT_REMAINDER_MS=$(( ADJ_TOTAL_MS % 1000 ))
   DRIFT_ADJUST_SECONDS=$(( -(ADJ_TOTAL_MS / 1000) ))
   return 0
+}
+
+is_battery_charging() {
+  CHARGING=$(/usr/bin/lipc-get-prop com.lab126.powerd isCharging 2>/dev/null)
+  [ "$CHARGING" = "1" ] && return 0
+  if [ -r /sys/devices/system/yoshi_battery/yoshi_battery0/charging ]; then
+    CHARGING=$(cat /sys/devices/system/yoshi_battery/yoshi_battery0/charging 2>/dev/null)
+    [ "$CHARGING" = "1" ] && return 0
+  fi
+  return 1
 }
 
 get_battery_level() {
@@ -937,19 +965,36 @@ display_frame() {
   fi
 }
 start_next_frame_render() {
-  BATTERY_OVERRIDE="$1"
+  BATTERY_OVERRIDE="${1:-}"
   [ -n "$SYNC_PID" ] && return 1
   next_render_in_progress && return 1
+  NEXT_FRAME_RENDER_EPOCH="$NEXT_FRAME_EPOCH"
+  NEXT_RENDER_MINUTE=$(((NEXT_FRAME_RENDER_EPOCH / 60) % 60))
   if is_uint "$BATTERY_OVERRIDE"; then
     BATTERY_LEVEL="$BATTERY_OVERRIDE"
   else
-    # The K4 gas gauge is deliberately sampled after the hourly refresh. Keep
-    # that displayed value between samples so ordinary minutes remain a pure
-    # changed-digit update.
-    BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
-    is_uint "$BATTERY_LEVEL" || BATTERY_LEVEL=$(get_battery_level)
+    if [ "$NEXT_RENDER_MINUTE" -eq 0 ]; then
+      # Sample quiet OCV battery before top-of-the-hour full refresh
+      BATTERY_LEVEL=$(get_battery_level)
+      CURRENT_VOLT=$(get_battery_voltage)
+      if [ -n "$CURRENT_VOLT" ]; then
+        echo "$CURRENT_VOLT" > "$RUNTIME_DIR/battery.volt"
+        log_debug "pre-hourly OCV battery sample: level=${BATTERY_LEVEL}% (${CURRENT_VOLT}mV)"
+      fi
+      # Monotonic discharge filter: if not charging, battery percentage cannot rise
+      if is_uint "$CURRENT_FRAME_BATTERY" && [ "$CURRENT_FRAME_BATTERY" -gt 0 ] && \
+         ! is_battery_charging; then
+        if [ "$BATTERY_LEVEL" -gt "$CURRENT_FRAME_BATTERY" ]; then
+          log_debug "monotonic discharge filter: capping level ${BATTERY_LEVEL}% to previous ${CURRENT_FRAME_BATTERY}%"
+          BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
+        fi
+      fi
+    elif is_uint "$CURRENT_FRAME_BATTERY"; then
+      BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
+    else
+      BATTERY_LEVEL=$(get_battery_level)
+    fi
   fi
-  NEXT_FRAME_RENDER_EPOCH="$NEXT_FRAME_EPOCH"
   NEXT_FRAME_BATTERY="$BATTERY_LEVEL"
   NEXT_FRAME_READY=0
   NEXT_FRAME_KIND=""
@@ -1043,7 +1088,7 @@ finish_next_frame_render() {
   return 1
 }
 prepare_next_minute() {
-  BATTERY_OVERRIDE="$1"
+  BATTERY_OVERRIDE="${1:-}"
   NEXT_FRAME_READY=0
   NEXT_FRAME_KIND=""
   NEXT_FRAME_CHANGED_DIGITS=0
@@ -1088,7 +1133,6 @@ refresh_battery_sample_after_hourly_full_refresh() {
 
   # Concurrently perform active NTP time sync (when its configured interval is
   # due) or a passive check while already awake for the battery sample.
-  NTP_SYNC_PID=""
   AUTO_SYNC_DUE=0
   AUTO_SYNC_NOW=$(scheduler_now 2>/dev/null)
   is_uint "$AUTO_SYNC_NOW" && [ "$AUTO_SYNC_NOW" -gt 0 ] || AUTO_SYNC_NOW=$(date +%s)
@@ -1123,37 +1167,17 @@ refresh_battery_sample_after_hourly_full_refresh() {
     fi
   fi
   if [ "$AUTO_SYNC_DUE" = "1" ]; then
-    rm -f "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP"
-    (
-      if time_sync_now "auto"; then
-        date +%s > "$AUTO_SYNC_RESULT_TMP"
-        mv "$AUTO_SYNC_RESULT_TMP" "$AUTO_SYNC_RESULT_FILE"
-      fi
-    ) &
-    NTP_SYNC_PID=$!
+    start_time_sync "auto"
   elif [ "$AUTO_TIME_CHECK_HOURLY" = "1" ] && [ -z "$SYNC_PID" ]; then
     CURRENT_SYNC_VOLT=$(get_battery_voltage)
     if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
       log_message "auto time check skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
     else
-      (
-        time_sync_now "check_only"
-      ) &
-      NTP_SYNC_PID=$!
+      start_time_sync "check_only"
     fi
   fi
 
   if [ "$BATTERY_REFRESH_SETTLE_SECONDS" -le 0 ]; then
-    [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
-    FRESH_BATTERY_LEVEL=$(get_battery_level)
-    FRESH_BATTERY_VOLT=$(get_battery_voltage)
-    VOLT_MSG=""
-    if [ -n "$FRESH_BATTERY_VOLT" ]; then
-      VOLT_MSG=" (${FRESH_BATTERY_VOLT}mV)"
-      echo "$FRESH_BATTERY_VOLT" > "$RUNTIME_DIR/battery.volt"
-    fi
-    log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL$VOLT_MSG (instant)"
-    echo "$FRESH_BATTERY_LEVEL"
     return 0
   fi
 
@@ -1167,8 +1191,6 @@ refresh_battery_sample_after_hourly_full_refresh() {
 
   while [ ! -f "$EXIT_FILE" ]; do
     if [ -f "$KEY_EVENT_FILE" ]; then
-      [ -n "$NTP_SYNC_PID" ] && kill "$NTP_SYNC_PID" 2>/dev/null
-      wifi_set_enabled 0
       log_message "battery refresh window interrupted by key event"
       return 1
     fi
@@ -1179,7 +1201,6 @@ refresh_battery_sample_after_hourly_full_refresh() {
     sleep 1
   done
 
-  [ -n "$NTP_SYNC_PID" ] && wait "$NTP_SYNC_PID" 2>/dev/null
   [ -f "$EXIT_FILE" ] && return 1
   FRESH_BATTERY_LEVEL=$(get_battery_level)
   FRESH_BATTERY_VOLT=$(get_battery_voltage)
@@ -1189,7 +1210,9 @@ refresh_battery_sample_after_hourly_full_refresh() {
     echo "$FRESH_BATTERY_VOLT" > "$RUNTIME_DIR/battery.volt"
   fi
   log_message "battery refresh sample: old=$CURRENT_FRAME_BATTERY new=$FRESH_BATTERY_LEVEL$VOLT_MSG awake_uptime_cs=$REFRESH_AWAKE_START_CS"
-  echo "$FRESH_BATTERY_LEVEL"
+  if [ "$FRESH_BATTERY_LEVEL" != "$CURRENT_FRAME_BATTERY" ]; then
+    prepare_next_minute "$FRESH_BATTERY_LEVEL"
+  fi
   return 0
 }
 
@@ -1241,6 +1264,11 @@ try_rtc_suspend() {
       elif [ "$DRIFT_ADJUST_SECONDS" -gt 0 ]; then
         adjust_system_time "$DRIFT_ADJUST_SECONDS"
         log_message "drift clock adjust: forward ${DRIFT_ADJUST_SECONDS}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
+      fi
+      if [ "$DRIFT_ADJUST_SECONDS" -ne 0 ]; then
+        NEXT_DISPLAY_CLOCK=$((NEXT_DISPLAY_CLOCK + DRIFT_ADJUST_SECONDS))
+        NEXT_FRAME_EPOCH=$((NEXT_FRAME_EPOCH + DRIFT_ADJUST_SECONDS))
+        CURRENT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + DRIFT_ADJUST_SECONDS))
       fi
     fi
   fi
@@ -1378,7 +1406,7 @@ start_time_sync() {
   log_message "$SYNC_REASON time synchronization requested"
   (
     trap 'wifi_set_enabled 0; exit 143' 1 2 15
-    if time_sync_now; then
+    if time_sync_now "$SYNC_REASON"; then
       echo success > "$SYNC_RESULT_TMP"
     else
       echo failure > "$SYNC_RESULT_TMP"
@@ -1549,20 +1577,36 @@ main() {
         ;;
       sync)
         if finish_time_sync; then
-          log_message "time synchronization succeeded"
+          log_message "$SYNC_REASON time synchronization succeeded"
           LAST_SYNC_EPOCH=$(date +%s)
+          [ "$SYNC_REASON" = "auto" ] && LAST_AUTO_SYNC_EPOCH="$LAST_SYNC_EPOCH"
           update_adaptive_drift_trim
-          cancel_next_frame_render
-          initialize_virtual_clock
-          if render_current_frame; then
-            display_frame "$CURRENT_FRAME" 1 "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"
+
+          SYSTEM_NOW=$(date +%s)
+          CURRENT_MIN=$(minute_epoch "$SYSTEM_NOW")
+          if [ "$CURRENT_MIN" = "$CURRENT_FRAME_EPOCH" ] && [ "$SYNC_REASON" != "manual" ]; then
+            # Current minute is already on screen and this was an automatic sync or check.
+            # Align virtual schedule without flashing the display
+            NEXT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + 60))
+            NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
+            DRIFT_REMAINDER_MS=0
+            log_message "virtual clock aligned: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=system display_clock=$NEXT_DISPLAY_CLOCK"
+          else
+            cancel_next_frame_render
+            initialize_virtual_clock
+            if render_current_frame; then
+              display_frame "$CURRENT_FRAME" 1 "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"
+            fi
+            LAST_INTERACTION_CLOCK=$(scheduler_now 2>/dev/null)
+            is_uint "$LAST_INTERACTION_CLOCK" || LAST_INTERACTION_CLOCK=$(date +%s)
+            prepare_next_minute
           fi
-          LAST_INTERACTION_CLOCK=$(scheduler_now 2>/dev/null)
-          is_uint "$LAST_INTERACTION_CLOCK" || LAST_INTERACTION_CLOCK=$(date +%s)
         else
-          log_message "time synchronization failed"
+          log_message "$SYNC_REASON time synchronization failed"
+          if [ "$SYNC_REASON" = "manual" ]; then
+            prepare_next_minute
+          fi
         fi
-        prepare_next_minute
         ;;
       minute)
         publish_minute_frame
@@ -1570,22 +1614,8 @@ main() {
         if truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"; then
           log_message "log truncated at ${LOG_MAX_BYTES} bytes"
         fi
-        FRESH_BATTERY_LEVEL=""
-        if FRESH_BATTERY_LEVEL=$(refresh_battery_sample_after_hourly_full_refresh); then
-          if [ -f "$AUTO_SYNC_RESULT_FILE" ]; then
-            AUTO_SYNC_COMPLETED_EPOCH=$(cat "$AUTO_SYNC_RESULT_FILE" 2>/dev/null)
-            rm -f "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP"
-            if is_uint "$AUTO_SYNC_COMPLETED_EPOCH" && [ "$AUTO_SYNC_COMPLETED_EPOCH" -gt 0 ]; then
-              LAST_AUTO_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
-              LAST_SYNC_EPOCH="$AUTO_SYNC_COMPLETED_EPOCH"
-            fi
-            update_adaptive_drift_trim
-            initialize_virtual_clock
-          fi
-          prepare_next_minute "$FRESH_BATTERY_LEVEL"
-        else
-          prepare_next_minute
-        fi
+        prepare_next_minute
+        refresh_battery_sample_after_hourly_full_refresh || true
         ;;
     esac
   done

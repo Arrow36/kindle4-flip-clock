@@ -1,4 +1,4 @@
-kfc (Kindle Flip Clock) 2.5.5
+kfc (Kindle Flip Clock) 2.5.6
 
 Requirements:
 - jailbroken Kindle 4 Non-Touch
