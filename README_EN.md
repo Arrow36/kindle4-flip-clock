@@ -30,6 +30,13 @@ Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (
    - `update_adaptive_drift_trim()` now computes residual `DRIFT_PPM` against accumulated RTC sleep seconds (`ACCUMULATED_SLEPT_SECONDS`) rather than total wall-clock elapsed time.
    - Replaced `$(cat ...)` and `$(printf ...)` in per-minute hot paths with shell builtins (`read -r` and parameter expansion) and moved log truncation checks to once per hour, eliminating ~55,000 child process forks per day.
 
+5. **Rejected Suspend `ash` Crash Guard & Orphaned RTC Alarm Cleanup**:
+   - **Rationale**: When auto-sync times out and shuts down Wi-Fi, calling `try_rtc_suspend` while the wireless SDIO driver (`ar6000`) is tearing down causes the kernel to reject `echo mem`. In Kindle 4's BusyBox 1.7.2, the builtin `echo` returns the raw write failure code `-1`, which `ash` treats as a fatal `Illegal number: -1` error, abruptly terminating `start.sh`. The exit trap triggers `cleanup()`, relaunching the native Kindle framework ("jumped out of the clock"). Meanwhile, the active hardware RTC alarm remains armed in the PMIC; when it fires seconds later during Java framework initialization, the unexpected hardware interrupt causes a hard kernel/PMIC lockup ("frozen, requiring hard reboot").
+   - **Implementation**:
+     - Sanitized `SUSPEND_RAW_STATUS` in `try_rtc_suspend` to valid exit codes (`0..255`, mapping negative numbers to `1`) and disarms the hardware RTC alarm (`echo -n 0 > "$RTC_PATH"`) immediately upon suspend rejection.
+     - Added a 3.0-second driver settle grace period (`WIFI_SETTLE_DEADLINE_CS = now + 300`) after disabling Wi-Fi in `finish_time_sync()` to guarantee the network driver has finished powering down before any suspend is attempted.
+     - Added explicit hardware RTC alarm disarm in `cleanup()` before starting `/etc/init.d/framework` to eliminate orphaned interrupt lockups during boot.
+
 ## What changed in 2.5.7 (Fix pre-render epoch mismatch, remove 1s post-wake delay & lock hourly battery)
 
 Based on 46 hours of empirical runtime telemetry (`kfc.log`, 4,844 lines):

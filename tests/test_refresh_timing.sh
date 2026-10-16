@@ -325,6 +325,7 @@ prepare_refresh_release 3659
 RTC_PATH="$RUNTIME_DIR/wakeup_enable"
 POWER_STATE_PATH="$RUNTIME_DIR/power_state"
 RTC_PMIC_EPOCH_PATH="$RUNTIME_DIR/pmic_epoch"
+LOG_FILE="$RUNTIME_DIR/test.log"
 echo "0" > "$RTC_PATH"
 echo "1000" > "$RTC_PMIC_EPOCH_PATH"
 : > "$POWER_STATE_PATH"
@@ -335,6 +336,21 @@ date() { echo 3600; }
 if try_rtc_suspend 3604; then exit 1; fi
 [ "$TEST_SLEEP_TARGET" = "7560" ]
 [ -z "$DISPLAY_SETTLE_DEADLINE_CS" ]
+
+# Rejected suspend (kernel refuses `echo mem`): must return a plain failure
+# status instead of aborting the shell, disarm the RTC alarm, and not count
+# the interval as RTC sleep.
+rm -f "$POWER_STATE_PATH"
+mkdir -p "$POWER_STATE_PATH"
+echo "0" > "$RTC_PATH"
+ACCUMULATED_SLEPT_SECONDS=0
+RTC_FAILURE_LOGGED=0
+REJECT_STATUS=0
+try_rtc_suspend 3700 2>/dev/null || REJECT_STATUS=$?
+[ "$REJECT_STATUS" -ge 1 ] && [ "$REJECT_STATUS" -le 255 ]
+[ "$(cat "$RTC_PATH")" = "0" ]
+[ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
+rmdir "$POWER_STATE_PATH"
 
 rm -rf "$RUNTIME_DIR"
 

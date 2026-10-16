@@ -389,6 +389,10 @@ cleanup() {
   fi
   SYNC_PID=""
 
+  # Disarm any pending RTC alarm before handing the device back to the
+  # framework, so a leftover alarm cannot fire during framework startup.
+  [ -w "$RTC_PATH" ] && echo -n 0 > "$RTC_PATH" 2>/dev/null
+
   # A killed synchronization worker may not have reached its own Wi-Fi
   # cleanup trap yet. Force Wi-Fi off before restoring the launch-time state.
   wifi_set_enabled 0
@@ -399,8 +403,6 @@ cleanup() {
     /usr/bin/lipc-set-prop -- com.lab126.powerd preventScreenSaver 0 >/dev/null 2>&1
     /etc/init.d/framework start >/dev/null 2>&1
   fi
-
-  [ -w "$RTC_PATH" ] && echo -n 0 > "$RTC_PATH" 2>/dev/null
 
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
     "$PID_FILE" "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
@@ -1417,8 +1419,24 @@ try_rtc_suspend() {
     log_debug "RTC suspend: planned_wake_system=$EXPECTED_WAKE_SYSTEM current_system=$SUSPEND_START_SYSTEM delay=$SUSPEND_SECONDS rtc_alarm=$RTC_ALARM_SECONDS pmic=${SUSPEND_START_PMIC:-unknown} display_clock=$NEXT_DISPLAY_CLOCK"
   fi
   echo mem > "$POWER_STATE_PATH" 2>> "$LOG_FILE"
-  SUSPEND_STATUS=$?
+  SUSPEND_RAW_STATUS=$?
   RESUME_SYSTEM=$(date +%s)
+  # BusyBox 1.7.2 echo returns fflush(stdout), i.e. -1, when the kernel
+  # rejects the write (suspend aborted by a busy driver). ash treats
+  # `return -1` as a fatal error that terminates the whole clock, so
+  # normalize to a plain 0..255 status before it can reach `return`.
+  SUSPEND_STATUS="$SUSPEND_RAW_STATUS"
+  case "$SUSPEND_STATUS" in ''|*[!0-9]*) SUSPEND_STATUS=1 ;; esac
+  [ "$SUSPEND_STATUS" -gt 255 ] && SUSPEND_STATUS=1
+  if [ "$SUSPEND_STATUS" -ne 0 ]; then
+    # The alarm stays armed after a rejected suspend; disarm it so the next
+    # attempt is not blocked by the RTC_STATE check.
+    echo -n 0 > "$RTC_PATH" 2>/dev/null || true
+    if [ "$RTC_FAILURE_LOGGED" = "0" ]; then
+      log_message "RTC suspend rejected: echo mem status=${SUSPEND_RAW_STATUS} start=$SUSPEND_START_SYSTEM resume=${RESUME_SYSTEM:-unknown} planned_wake=$EXPECTED_WAKE_SYSTEM"
+    fi
+    return "$SUSPEND_STATUS"
+  fi
   if is_uint "$RESUME_SYSTEM" && [ "$RESUME_SYSTEM" -gt 0 ]; then
     RTC_RESUME_LATENESS_SECONDS=$((RESUME_SYSTEM - EXPECTED_WAKE_SYSTEM))
     if [ $((RESUME_SYSTEM + 1)) -lt "$EXPECTED_WAKE_SYSTEM" ]; then
@@ -1612,6 +1630,17 @@ finish_time_sync() {
   SYNC_PID=""
   rm -f "$SYNC_PID_FILE" "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP"
   wifi_set_enabled 0
+  # Let wifid finish powering the radio down before the next suspend;
+  # suspending while the SDIO driver is still busy can make the kernel
+  # reject `echo mem`. Reuses the generic no-suspend-before deadline.
+  WIFI_SETTLE_NOW_CS=$(monotonic_centiseconds 2>/dev/null) || WIFI_SETTLE_NOW_CS=""
+  if is_uint "$WIFI_SETTLE_NOW_CS"; then
+    WIFI_SETTLE_DEADLINE_CS=$((WIFI_SETTLE_NOW_CS + 300))
+    if ! is_uint "$DISPLAY_SETTLE_DEADLINE_CS" || \
+       [ "$DISPLAY_SETTLE_DEADLINE_CS" -lt "$WIFI_SETTLE_DEADLINE_CS" ]; then
+      DISPLAY_SETTLE_DEADLINE_CS="$WIFI_SETTLE_DEADLINE_CS"
+    fi
+  fi
   [ "$SYNC_STATUS" = "success" ]
 }
 

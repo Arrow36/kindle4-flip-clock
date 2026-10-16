@@ -19,6 +19,13 @@ All notable changes to this project are documented here.
 - **Actual Sleep Duration Denominator for Adaptive Drift Calibration**: `try_rtc_suspend()` now accumulates actual RTC suspend seconds (`ACCUMULATED_SLEPT_SECONDS`), and `update_adaptive_drift_trim()` computes residual `DRIFT_PPM` against actual sleep time rather than total wall-clock elapsed time, preventing awake intervals or key presses from skewing the learned crystal trim.
 - **Hardened `adjust_system_time` Pipe Handling**: Uses the persistent `>&8` descriptor with `kill -0` liveness check and falls back to one-shot `luajit -e` if the persistent server is unavailable.
 
+### Fixed
+
+- **BusyBox 1.7.2 `ash` Shell Crash on Rejected Suspend & Native Framework Freeze**: Fixed an issue where kernel rejection of `echo mem` (e.g. while the Wi-Fi `ar6000` SDIO driver is powering down) causes `echo` in BusyBox 1.7.2 to return exit status `-1`. `ash` treats `return -1` as a fatal syntax error, terminating `start.sh` immediately and triggering `cleanup()`, which relaunches the native Kindle framework. Concurrently, an active hardware RTC alarm previously armed for suspend was left pending, which fired during framework initialization and caused a hardware interrupt freeze (requiring a hard power reboot).
+  - Sanitized `SUSPEND_RAW_STATUS` in `try_rtc_suspend()` to `0..255` (converting invalid numbers such as `-1` to `1`) and added automatic RTC alarm cancellation (`echo -n 0 > "$RTC_PATH"`) upon suspend rejection.
+  - Added a 3.0-second driver settle grace period (`WIFI_SETTLE_DEADLINE_CS = now + 300`) after disabling Wi-Fi in `finish_time_sync()` to prevent `try_rtc_suspend()` from calling `echo mem` while the kernel SDIO driver is still tearing down.
+  - Added explicit hardware RTC alarm cancellation in `cleanup()` before starting `/etc/init.d/framework` to ensure orphaned alarms can never trigger during Kindle OS boot.
+
 ## 2.5.7 - 2026-10-16
 
 Based on 46-hour empirical runtime telemetry (`kfc.log`, 4,844 lines).
