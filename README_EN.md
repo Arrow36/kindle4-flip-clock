@@ -10,19 +10,20 @@ The extension shows the time, Gregorian date, weekday, Chinese lunar date, and b
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
 
-## What changed in 2.5.8 (Duplex reply pipe, FFI microsecond alignment & 94% less userspace awake time)
+## What changed in 2.5.8 (Duplex reply pipe, FFI microsecond alignment & physical waveform settle guard)
 
-Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (which lacks `usleep` and fractional `sleep`) forced every `sleep_ms` and `pause_briefly` call to sleep a full 1000ms (`sleep 1`), keeping the CPU awake for ~6.0s per minute for an 80ms screen update:
+Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (which lacks `usleep` and fractional `sleep`) forced every `sleep_ms` and `pause_briefly` call to sleep a full 1000ms (`sleep 1`), keeping the CPU awake for ~6.0s per minute:
 
 1. **Duplex Reply Pipe (`RENDER_REPLY_FIFO`) for Zero-Latency IPC**:
-   - Added a response notification pipe (`render.reply`, `fd 9`) so `wait_renderer_reply()` wakes immediately upon request completion (`0.5ms` for `ADJUST`, `2ms` for `PREPARE`, `80ms` for `DISPLAY`) instead of sleeping 1 full second on every IPC call.
+   - Added a response notification pipe (`render.reply`, `fd 9`) so `wait_renderer_reply()` wakes immediately upon request completion (`0.5ms` for `ADJUST`, `2ms` for `PREPARE`, `20–80ms` for `DISPLAY`) instead of sleeping 1 full second on every IPC call.
 
-2. **Synchronous In-Process Pre-rendering (~0.35s Awake per Minute)**:
-   - When the persistent renderer is active, `PREPARE` runs synchronously in 2ms without forking a background subshell or polling in `wait_for_event_or_minute()`. The Kindle now re-enters deep `mem` suspend at `:00.1s` instead of `:03.5s` (sleeping 59s/min instead of 54s/min, saving ~2.3 hours of active CPU time / ~215 mAh per day).
+2. **Synchronous In-Process Pre-rendering & E Ink Physical Waveform Settle Guard (`DISPLAY_SETTLE_DEADLINE_CS`)**:
+   - When the persistent renderer is active, `PREPARE` runs synchronously in 2ms (overlapping with the hardware E Ink scan) without forking a background subshell or polling in `wait_for_event_or_minute()`.
+   - Because Kindle 4's `FBIO_EINK_UPDATE_DISPLAY_AREA` ioctl returns asynchronously in `20–30ms` while the physical waveform takes `PARTIAL_REFRESH_DURATION_MS=800` (`1400ms` full), `try_rtc_suspend()` waits via `usleep` (0% CPU) until `DISPLAY_SETTLE_DEADLINE_CS` (`refresh_start + 1000ms` partial / `1600ms` full, including `200ms` charge-pump discharge margin) before entering deep `mem` suspend at `:00.6s` (instead of `:03.5s`), eliminating vertical scanline artifacts while saving ~3s of awake time every minute.
 
-3. **LuaJIT FFI Microsecond Timing (`WAIT_UNTIL` & `SLEEP_MS`)**:
+3. **LuaJIT FFI Microsecond Timing (`WAIT_UNTIL` & `SLEEP_MS`) & Short-Alarm Guard**:
    - Integrated C `gettimeofday` and `usleep` in `render_server.lua` to eliminate both the `date +%s` whole-second truncation jitter (`0~990ms`) and the BusyBox `sleep 1` overshoot (`+420ms`).
-   - Tuned default `RTC_WAKE_LEAD_SECONDS` to `1` and `AUTO_TIME_SYNC_INTERVAL_HOURS` to `6` (settings schema v8).
+   - Preserved `RTC_WAKE_LEAD_SECONDS=2` to absorb hardware wake jitter, raised minimum RTC suspend threshold from `2s` to `5s` to avoid `mxc_rtc.0` short-alarm stalls, and tuned default `AUTO_TIME_SYNC_INTERVAL_HOURS` to `6` (settings schema v8).
 
 4. **Actual Sleep Duration Drift Denominator & Zero-Fork Hot Path**:
    - `update_adaptive_drift_trim()` now computes residual `DRIFT_PPM` against accumulated RTC sleep seconds (`ACCUMULATED_SLEPT_SECONDS`) rather than total wall-clock elapsed time.

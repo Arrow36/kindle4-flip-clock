@@ -10,21 +10,24 @@
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
 
-## 2.5.8 的主要修改（双工管道消除 `sleep 1` 盲等、微秒级 FFI 对齐与每分钟 0.35s 极速回睡）
+## 2.5.8 的主要修改（双工管道消除 `sleep 1` 盲等、微秒级 FFI 对齐与物理波形安全回睡）
 
-通过对真机 `/proc/uptime` 内核单调时钟的逐秒剖析，定位到 Kindle 4 原生 BusyBox 1.7.2 因缺失 `usleep` 导致所有 `sleep_ms` / `pause_briefly` 退化为 `sleep 1`（每分钟刷屏仅需 80ms，却在用户态白白空等 6.0 秒，占日常总耗电的 65% 以上），进行了全方位底层重构：
+通过对真机 `/proc/uptime` 内核单调时钟的逐秒剖析，定位到 Kindle 4 原生 BusyBox 1.7.2 因缺失 `usleep` 导致所有 `sleep_ms` / `pause_briefly` 退化为 `sleep 1`（每分钟在用户态白白空等 6.0 秒），在严格保留实机标定的物理刷新时长（局刷 800ms / 全刷 1400ms）与 2 秒提前唤醒裕量的前提下，进行了底层重构：
 
 1. **双工响应管道（`RENDER_REPLY_FIFO`）实现 0 毫秒 IPC 唤醒**
-   - **修改理由**：此前 `wait_renderer_reply()` 发送指令后若第 1 毫秒未见状态文件，立刻调用 `pause_briefly` 盲睡 1 整秒，导致 `ADJUST`（实际 0.5ms）、`PREPARE`（实际 2ms）、`DISPLAY`（实际 80ms）每次通信都白白卡顿 1 秒。
+   - **修改理由**：此前 `wait_renderer_reply()` 发送指令后若第 1 毫秒未见状态文件，立刻调用 `pause_briefly` 盲睡 1 整秒，导致 `ADJUST`（实际 0.5ms）、`PREPARE`（实际 2ms）、`DISPLAY`（驱动返回 20~30ms）每次通信都白白卡顿 1 秒。
    - **技术实现**：新增 `render.reply` 响应通知管道（`fd 9`），`render_server.lua` 写完状态文件即刻通过管道唤醒主进程，0% CPU 轮询、0 毫秒盲等延迟，且渲染服务异常退出时内核自动关闭写端返回 EOF 绝不死锁。
 
-2. **同步直通预渲染与每分钟 0.35 秒极速回睡（砍掉 94% 用户态清醒时间）**
-   - **修改理由**：此前每分钟预渲染都会 `fork` 后台子进程并让主循环在 `wait_for_event_or_minute` 中轮询等待，叠加两次 `sleep 1` 后直到 `:03.5` 秒才能进入深度休眠。
-   - **技术实现**：当持久渲染服务就绪时，`PREPARE`（耗时仅 2ms）直接在主进程内同步完成并当场置位 `NEXT_FRAME_READY=1`。每分钟 `:00` 刷完屏后在 **`:00.1` 秒即可直接进入 `echo mem` 深度休眠**（每分钟休眠时长从 54 秒提升至 59 秒，每天为 CPU 省下 ~2.3 小时通电时间 / ~215 mAh 电量）。
+2. **同步直通预渲染与墨水屏物理波形保护窗口（`DISPLAY_SETTLE_DEADLINE_CS`）**
+   - **修改理由**：此前每分钟预渲染都会 `fork` 后台子进程并让主循环在 `wait_for_event_or_minute` 中轮询等待，叠加两次 `sleep 1` 后直到 `:03.5` 秒才能进入深度休眠；但同时 Kindle 4 的 `FBIO_EINK_UPDATE_DISPLAY_AREA` 驱动是异步返回的（20~30ms 即返回），若立即挂起会截断正在扫描的墨水屏物理波形（800ms）并留下竖向残线。
+   - **技术实现**：
+     - 当持久渲染服务就绪时，`PREPARE`（耗时仅 2ms）在触发刷屏后直接在主进程内同步完成（与墨水屏硬件扫描完全并行重叠）；
+     - 严格遵循实机测定的 `PARTIAL_REFRESH_DURATION_MS=800` / `FULL_REFRESH_DURATION_MS=1400`（外加 200ms 电荷泵放电余量，即局刷 1000ms、全刷 1600ms）设定 `DISPLAY_SETTLE_DEADLINE_CS`；
+     - `try_rtc_suspend()` 在挂起前通过 `usleep`（0% CPU）精确等待物理波形完整走完，在 **`:00.6` 秒安全进入 `echo mem` 深度休眠**（相比此前 `:03.5` 秒回睡，每分钟多睡 ~3 秒且彻底杜绝竖向刷新残线）。
 
-3. **LuaJIT FFI 微秒级时钟对齐（`WAIT_UNTIL` / `SLEEP_MS`）**
+3. **LuaJIT FFI 微秒级时钟对齐（`WAIT_UNTIL` / `SLEEP_MS`）与防短闹钟假死**
    - **修改理由**：`date +%s` 仅有整秒精度（存在 0~990ms 截断抖动），且 BusyBox `sleep 1` 总是睡过头 420ms。
-   - **技术实现**：在 `render_server.lua` 中接入 C 标准库 `gettimeofday` 与 `usleep`，新增 `WAIT_UNTIL` 与 `SLEEP_MS` 指令，以微秒级精度计算并睡眠至目标刷新点，将刷新偏差从 `420ms ~ 1420ms` 压缩至 **$\pm 30\text{ms}$ 以内**；同时将默认唤醒提前量 `RTC_WAKE_LEAD_SECONDS` 下调为 `1` 秒，默认自动对时间隔 `AUTO_TIME_SYNC_INTERVAL_HOURS` 调优为 `6` 小时。
+   - **技术实现**：在 `render_server.lua` 中接入 C 标准库 `gettimeofday` 与 `usleep`，新增 `WAIT_UNTIL` 与 `SLEEP_MS` 指令，保留实机验证的 `RTC_WAKE_LEAD_SECONDS=2` 吸收硬件唤醒抖动，再以微秒级精度睡眠至 `-400ms` 触发刷屏；同时将最小挂起闹钟门槛提高至 `5` 秒防止 `mxc_rtc.0` 短闹钟假死，默认自动对时间隔 `AUTO_TIME_SYNC_INTERVAL_HOURS` 调优为 `6` 小时。
 
 4. **实际休眠时长分母校准与热路径零 Fork 改造**
    - **真实休眠分母**：在 `try_rtc_suspend()` 中累加真实休眠秒数 `ACCUMULATED_SLEPT_SECONDS`，自适应漂移校准直接以实际休眠时间作为分母计算残差 PPM，彻底消除按键亮屏或对时耗时对晶振学习值的干扰；
