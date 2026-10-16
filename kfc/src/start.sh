@@ -919,8 +919,12 @@ render_frame() {
   return 0
 }
 render_current_frame() {
-  BATTERY_LEVEL=$(get_battery_level)
-  CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
+  if is_uint "$CURRENT_FRAME_BATTERY" && [ "$CURRENT_FRAME_BATTERY" -gt 0 ]; then
+    BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
+  else
+    BATTERY_LEVEL=$(get_battery_level)
+    CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
+  fi
   log_debug "current-frame sample: target=$CURRENT_FRAME_EPOCH battery=$CURRENT_FRAME_BATTERY"
   render_frame "$CURRENT_FRAME_EPOCH" "$CURRENT_FRAME"
 }
@@ -1266,9 +1270,8 @@ try_rtc_suspend() {
         log_message "drift clock adjust: forward ${DRIFT_ADJUST_SECONDS}s (ppm=$EFFECTIVE_PPM, slept=${ACTUAL_SLEPT_SECONDS}s, rem=${DRIFT_REMAINDER_MS}ms)"
       fi
       if [ "$DRIFT_ADJUST_SECONDS" -ne 0 ]; then
-        NEXT_DISPLAY_CLOCK=$((NEXT_DISPLAY_CLOCK + DRIFT_ADJUST_SECONDS))
-        NEXT_FRAME_EPOCH=$((NEXT_FRAME_EPOCH + DRIFT_ADJUST_SECONDS))
-        CURRENT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + DRIFT_ADJUST_SECONDS))
+        REFRESH_BOUNDARY_UPTIME_CS=""
+        REFRESH_PLANNED_START_UPTIME_CS=""
       fi
     fi
   fi
@@ -1339,9 +1342,9 @@ wait_for_event_or_minute() {
         if [ "$RTC_WOKE_EARLY" = "1" ]; then
           LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
           log_message "early hardware wake; awake interval restarted for ${IDLE_SUSPEND_SECONDS}s"
+          # Give waitforkey time to publish a physical key that caused wake-up.
+          pause_briefly
         fi
-        # Give waitforkey time to publish a physical key that caused wake-up.
-        pause_briefly
         continue
       fi
       if [ "$RTC_FAILURE_LOGGED" = "0" ]; then
@@ -1475,8 +1478,12 @@ publish_minute_frame() {
   fi
   log_message "next-minute frame rejected: expected_target=$NEXT_FRAME_EPOCH ready=$NEXT_FRAME_READY kind=${META_KIND:-missing} meta_target=${META_EPOCH:-missing} meta_battery=${META_BATTERY:-missing}"
   cancel_next_frame_render
-  BATTERY_LEVEL=$(get_battery_level)
-  CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
+  if is_uint "$CURRENT_FRAME_BATTERY" && [ "$CURRENT_FRAME_BATTERY" -gt 0 ]; then
+    BATTERY_LEVEL="$CURRENT_FRAME_BATTERY"
+  else
+    BATTERY_LEVEL=$(get_battery_level)
+    CURRENT_FRAME_BATTERY="$BATTERY_LEVEL"
+  fi
   log_message "next-minute frame missing or stale; rendering target=$NEXT_FRAME_EPOCH battery=$CURRENT_FRAME_BATTERY"
   if render_frame "$NEXT_FRAME_EPOCH" "$CURRENT_FRAME"; then
     display_frame "$CURRENT_FRAME" 0 "$NEXT_FRAME_EPOCH" "$CURRENT_FRAME_BATTERY"

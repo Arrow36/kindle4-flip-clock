@@ -2,13 +2,29 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.5.6** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.5.7** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.5.7 的主要修改（修复预渲染帧 Epoch 错位拒绝、消除唤醒 1 秒盲等与锁死整点电量）
+
+基于 46 小时（4,844 行日志）的实测追踪，修复了 2.5.6 中因平移帧目标时间戳引发的连锁回归问题：
+
+1. **根除 `next-minute frame rejected` 预渲染帧拒绝与整点对时超时**
+   - **修改理由**：2.5.6 在休眠唤醒执行 `drift clock adjust`（每 3~4 分钟拨快 1 秒）时，顺带给 `NEXT_DISPLAY_CLOCK`、`NEXT_FRAME_EPOCH` 和 `CURRENT_FRAME_EPOCH` 加上了 `+1s`。这破坏了帧目标时间戳必须是整分钟（`% 60 == 0`）的不变量，导致预渲染缓存的整分帧（`...00`）与变动后的目标（`...01`）失配，46 小时内触发 606 次帧拒绝并退回耗时 8 秒的同步全屏 PNG 渲染；同时导致 `NEXT_DISPLAY_CLOCK` 每小时偏离整点 15~19 秒，使整点刷新落入真实时间的 `:30s ~ :58s`，直接撞上 `time_sync.sh` 的 `:38s` 截止线（22 次自动对时失败 18 次），且同向平移抵消了时钟漂移补偿。
+   - **技术实现**：移除对 `NEXT_DISPLAY_CLOCK`、`NEXT_FRAME_EPOCH` 和 `CURRENT_FRAME_EPOCH` 的偏移累加，严格保持分钟级整分对齐；唤醒调表后仅清空 `REFRESH_BOUNDARY_UPTIME_CS` 与 `REFRESH_PLANNED_START_UPTIME_CS` 让高精度计时器重新锚定。
+
+2. **消除 Kindle 4 BusyBox `sleep 1` 导致的唤醒后 1000ms 盲等延迟**
+   - **修改理由**：Kindle 4 原生 BusyBox 1.7.2 不支持 `usleep` 和小数秒 `sleep`，`pause_briefly()` 实际退化为整整 1 秒的 `sleep 1`。此前在正常 RTC 定时唤醒后无条件执行了一次 `pause_briefly`，导致 `rtc_late=1`（`:59` 秒唤醒）时白白睡过 `:00` 秒边界，产生 `1420ms` 延迟。
+   - **技术实现**：仅在提前唤醒（`RTC_WOKE_EARLY=1`，如按键中断唤醒）轮询事件时才调用 `pause_briefly`，正常定时唤醒后立即进入 `/proc/uptime` 厘秒级对齐。
+
+3. **非整点重绘严格复用已锁定的整点开路电量**
+   - **修改理由**：当整点对时成功重锚或异常回退触发 `render_current_frame()` 时，此前代码会重新调用 `get_battery_level()`，此时 Wi-Fi 刚关闭，采样到负载压降后的虚低电压。
+   - **技术实现**：在 `render_current_frame()` 与回退分支中优先复用已锁定的 `CURRENT_FRAME_BATTERY`，确保全天电量仅在整点休眠唤醒的纯净开路状态（OCV）更新一次。
 
 ## 2.5.6 的主要修改（整点零跳帧、开路电压稳态采样与续航大幅翻倍）
 

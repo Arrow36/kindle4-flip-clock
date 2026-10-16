@@ -241,6 +241,15 @@ start_next_frame_render
 [ "$NEXT_FRAME_BATTERY" = 85 ]
 cancel_next_frame_render
 
+# Test that render_current_frame preserves locked CURRENT_FRAME_BATTERY instead of re-sampling under load
+get_battery_level() { echo 65; }
+CURRENT_FRAME_BATTERY=82
+CURRENT_FRAME_EPOCH=3660
+render_frame() { :; }
+render_current_frame
+[ "$CURRENT_FRAME_BATTERY" = 82 ]
+[ "$BATTERY_LEVEL" = 82 ]
+
 rm -rf "$RUNTIME_DIR"
 
 printf 'refresh timing tests passed\n'

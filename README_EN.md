@@ -2,13 +2,28 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.6** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.7** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.7 (Fix pre-render epoch mismatch, remove 1s post-wake delay & lock hourly battery)
+
+Based on 46 hours of empirical runtime telemetry (`kfc.log`, 4,844 lines):
+
+1. **Fixed Pre-rendered Frame Rejection (`next-minute frame rejected`) & Hourly Sync Collisions**:
+   - **Rationale**: In 2.5.6, shifting `NEXT_DISPLAY_CLOCK`, `NEXT_FRAME_EPOCH`, and `CURRENT_FRAME_EPOCH` by `DRIFT_ADJUST_SECONDS` (`+1s` every 3–4 minutes) broke the `epoch % 60 == 0` invariant. This caused 606 pre-rendered frames to be rejected and re-rendered synchronously as full PNGs (~7–10s awake each), walked `NEXT_DISPLAY_CLOCK` into `:30s ~ :58s` where hourly auto-sync immediately hit the `:38s` hard deadline, and canceled out the drift compensation in relative sleep calculations.
+   - **Implementation**: Kept all virtual display and frame epochs strictly aligned to `:00` minute boundaries, and instead cleared `REFRESH_BOUNDARY_UPTIME_CS` and `REFRESH_PLANNED_START_UPTIME_CS` after drift adjustments so uptime boundary targets recalculate cleanly.
+
+2. **Eliminated 1000ms Post-Wake Delay on BusyBox 1.7.2**:
+   - **Rationale**: Kindle 4's BusyBox 1.7.2 lacks `usleep` and fractional `sleep`, so `pause_briefly()` falls back to `sleep 1` (1000ms). Running `pause_briefly` unconditionally after scheduled RTC wakes delayed `rtc_late=1` wakes past the `:00` boundary (`start_offset_ms=1420ms`).
+   - **Implementation**: Moved `pause_briefly` inside the `RTC_WOKE_EARLY=1` branch so normal scheduled RTC wakes proceed immediately to centisecond `/proc/uptime` alignment.
+
+3. **Locked Hourly OCV Battery Across Mid-Hour Redraws**:
+   - **Implementation**: Preserved `CURRENT_FRAME_BATTERY` in `render_current_frame()` and `publish_minute_frame()` fallback so post-sync re-anchors and fallback renders never re-sample transient Wi-Fi load droop.
 
 ## What changed in 2.5.6 (Zero dropped frames, OCV battery sampling & doubled battery life)
 

@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.7 - 2026-10-16
+
+Based on 46-hour empirical runtime telemetry (`kfc.log`, 4,844 lines).
+
+### Fixed
+
+- **606 Rejected Pre-rendered Frames & Epoch Invariant Corruption**: Fixed a critical regression introduced in 2.5.6 where applying `DRIFT_ADJUST_SECONDS` (`+1s` forward compensation) also mutated `NEXT_DISPLAY_CLOCK`, `NEXT_FRAME_EPOCH`, and `CURRENT_FRAME_EPOCH`:
+  - Preserved the strict `epoch % 60 == 0` invariant across all virtual clock and frame target epochs, completely eliminating the 606 `next-minute frame rejected` errors and their 7–10s emergency full PNG fallback renders (saving ~1.4 hours of unnecessary CPU awake time per day).
+  - Kept `NEXT_DISPLAY_CLOCK` anchored to real `:00` minute boundaries so top-of-the-hour refreshes occur at `:00` instead of walking into `:30s ~ :58s` and colliding with the `:38s` Wi-Fi sync deadline.
+  - Restored accurate drift compensation so `adjust_system_time` is no longer canceled out by shifting `NEXT_DISPLAY_CLOCK` in the same direction.
+  - Reset `REFRESH_BOUNDARY_UPTIME_CS` and `REFRESH_PLANNED_START_UPTIME_CS` after drift adjustment so uptime boundary diagnostics recalculate cleanly without shifting minute epochs.
+- **1000ms Post-Wake Polling Delay on BusyBox 1.7.2**: Moved `pause_briefly` inside the `if [ "$RTC_WOKE_EARLY" = "1" ]; then` branch in `wait_for_event_or_minute()`. On Kindle 4's BusyBox 1.7.2 (which lacks `usleep` and fractional `sleep`), `pause_briefly` falls back to `sleep 1` (1000ms), which previously delayed every scheduled `rtc_late=1` wake past the minute boundary (`start_offset_ms=1420ms`).
+- **Mid-Hour Battery Re-Sampling Under Load**: Preserved locked `CURRENT_FRAME_BATTERY` in `render_current_frame()` and `publish_minute_frame()` fallback so mid-hour full redraws (e.g., after SNTP sync or key events) never re-sample transient load-drooped voltage.
+
 ## 2.5.6 - 2026-10-14
 
 Based on 52.7-hour empirical runtime telemetry (4,688 lines in `kfc.log`).
