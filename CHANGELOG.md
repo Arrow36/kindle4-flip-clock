@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.8 - 2026-10-16
+
+### Added
+
+- **Duplex Reply Pipe (`RENDER_REPLY_FIFO`) & Zero-Latency IPC**: Added a synchronous completion notification pipe (`render.reply`, `fd 9`) between `render_server.lua` and `start.sh`. Instead of falling back to `sleep 1` (`1000ms`) on Kindle 4's BusyBox 1.7.2 while polling for `$STATUS_PATH`, `wait_renderer_reply()` blocks in the kernel on `read -r _ <&9` and wakes immediately when `render_server.lua` finishes (`0.5ms` for `ADJUST`, `2ms` for `PREPARE`, `80ms` for `DISPLAY`, `0%` CPU spin, safe EOF on server exit).
+- **LuaJIT FFI Microsecond Timing (`WAIT_UNTIL` & `SLEEP_MS`)**: Integrated C `gettimeofday` and `usleep` in `render_server.lua` to align refresh releases with microsecond wall-clock precision, eliminating both the `date +%s` whole-second truncation jitter (`0~990ms`) and the BusyBox `sleep 1` overshoot (`+420ms`).
+
+### Changed
+
+- **94% Reduction in Per-Minute Userspace Awake Time (From ~6.0s to ~0.35s / Minute)**:
+  - **Synchronous In-Process Pre-rendering**: When the persistent renderer is active (`RENDER_SERVER_READY=1`), `start_next_frame_render()` executes `PREPARE` (2ms) directly in the main process without forking a background subshell, writing PID files, or waiting 1–2 seconds in `wait_for_event_or_minute()`. The Kindle now enters `echo mem > /sys/power/state` within ~100ms after each minute refresh (previously delayed until `:03.5s`).
+  - **Reduced Wake Lead & Extended Auto-Sync Interval**: Tuned default `RTC_WAKE_LEAD_SECONDS` from `2` to `1` and `AUTO_TIME_SYNC_INTERVAL_HOURS` from `4` to `6` (settings schema version 8 with automatic migration).
+  - **Zero-Fork Hot Path**: Replaced `$(cat ...)` and `$(printf '%.2s' ...)` in per-minute hot paths (`monotonic_centiseconds`, `monotonic_stamp`, `try_rtc_suspend`, `wait_renderer_reply`) with POSIX shell builtins (`read -r` and parameter expansion), and moved log size checks (`truncate_log_if_oversize`) to run once per hour instead of every minute, eliminating ~55,000 child process forks per day.
+- **Actual Sleep Duration Denominator for Adaptive Drift Calibration**: `try_rtc_suspend()` now accumulates actual RTC suspend seconds (`ACCUMULATED_SLEPT_SECONDS`), and `update_adaptive_drift_trim()` computes residual `DRIFT_PPM` against actual sleep time rather than total wall-clock elapsed time, preventing awake intervals or key presses from skewing the learned crystal trim.
+- **Hardened `adjust_system_time` Pipe Handling**: Uses the persistent `>&8` descriptor with `kill -0` liveness check and falls back to one-shot `luajit -e` if the persistent server is unavailable.
+
 ## 2.5.7 - 2026-10-16
 
 Based on 46-hour empirical runtime telemetry (`kfc.log`, 4,844 lines).

@@ -22,6 +22,7 @@ SYNC_RESULT_TMP="$RUNTIME_DIR/time_sync.result.tmp"
 AUTO_SYNC_RESULT_FILE="$RUNTIME_DIR/auto_sync.result"
 AUTO_SYNC_RESULT_TMP="$RUNTIME_DIR/auto_sync.result.tmp"
 RENDER_REQUEST_FIFO="$RUNTIME_DIR/render.request"
+RENDER_REPLY_FIFO="$RUNTIME_DIR/render.reply"
 RENDER_SERVER_PID_FILE="$RUNTIME_DIR/render_server.pid"
 PARTIAL_DISABLED_FILE="$RUNTIME_DIR/partial.disabled"
 TRIM_PERSIST_FILE="$BASE_DIR/learned_ppm.trim"
@@ -34,7 +35,7 @@ THEME=light
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=20
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-AUTO_TIME_SYNC_INTERVAL_HOURS=4
+AUTO_TIME_SYNC_INTERVAL_HOURS=6
 AUTO_TIME_CHECK_HOURLY=0
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
@@ -43,15 +44,16 @@ ADAPTIVE_PPM_TRIM=0
 DRIFT_PPM_MIN=-8000
 DRIFT_PPM_MAX=12000
 IDLE_SUSPEND_SECONDS=15
-RTC_WAKE_LEAD_SECONDS=2
+RTC_WAKE_LEAD_SECONDS=1
 PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
 BATTERY_REFRESH_SETTLE_SECONDS=0
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SYNC_EPOCH=0
+ACCUMULATED_SLEPT_SECONDS=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
-CURRENT_SETTINGS_VERSION=7
+CURRENT_SETTINGS_VERSION=8
 SETTINGS_MIGRATED=0
 DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
@@ -73,6 +75,7 @@ NEXT_RENDER_PID=""
 SYNC_PID=""
 RENDER_SERVER_PID=""
 RENDER_SERVER_READY=0
+RENDER_REPLY_READY=0
 RENDER_REQUEST_SEQUENCE=0
 KEY_ACTION=""
 WAIT_REASON=""
@@ -149,6 +152,10 @@ load_settings() {
       [ "$RTC_WAKE_LEAD_SECONDS" = "3" ] && RTC_WAKE_LEAD_SECONDS=2
       [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = "1" ] && AUTO_TIME_SYNC_INTERVAL_HOURS=4
     fi
+    if [ "$SETTINGS_VERSION" -lt 8 ]; then
+      [ "$RTC_WAKE_LEAD_SECONDS" = "2" ] && RTC_WAKE_LEAD_SECONDS=1
+      [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = "4" ] && AUTO_TIME_SYNC_INTERVAL_HOURS=6
+    fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
   fi
@@ -156,10 +163,10 @@ load_settings() {
   case "$HOUR_MODE" in 12|24) ;; *) HOUR_MODE=24 ;; esac
   case "$THEME" in light|dark) ;; *) THEME=light ;; esac
   is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=20
-  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=4
+  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=6
   is_uint "$RTC_DRIFT_COMPENSATION_PPM" || RTC_DRIFT_COMPENSATION_PPM=0
   is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=15
-  is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=2
+  is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=1
   is_uint "$PARTIAL_REFRESH_DURATION_MS" || PARTIAL_REFRESH_DURATION_MS=800
   is_uint "$FULL_REFRESH_DURATION_MS" || FULL_REFRESH_DURATION_MS=1400
   is_uint "$BATTERY_REFRESH_SETTLE_SECONDS" || BATTERY_REFRESH_SETTLE_SECONDS=0
@@ -231,9 +238,10 @@ cancel_next_frame_render() {
 }
 
 stop_render_server() {
-  # Close the request pipe before stopping the server. File descriptor 8 is
-  # reserved for the persistent renderer for the lifetime of this process.
+  # Close the request and reply pipes before stopping the server. File
+  # descriptors 8 and 9 are reserved for the persistent renderer.
   exec 8>&- 2>/dev/null
+  exec 9<&- 2>/dev/null
   if [ -n "$RENDER_SERVER_PID" ]; then
     if kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
       kill "$RENDER_SERVER_PID" 2>/dev/null
@@ -242,38 +250,40 @@ stop_render_server() {
   fi
   RENDER_SERVER_PID=""
   RENDER_SERVER_READY=0
-  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO"
+  RENDER_REPLY_READY=0
+  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO"
 }
 
-create_render_request_fifo() {
+create_fifo_file() {
+  TARGET_FIFO="$1"
   FIFO_CREATE_METHOD=""
-  rm -f "$RENDER_REQUEST_FIFO"
+  rm -f "$TARGET_FIFO"
 
   if command -v mkfifo >/dev/null 2>&1 && \
-     mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+     mkfifo "$TARGET_FIFO" 2>> "$LOG_FILE"; then
     FIFO_CREATE_METHOD=mkfifo
   else
-    rm -f "$RENDER_REQUEST_FIFO"
+    rm -f "$TARGET_FIFO"
     if command -v busybox >/dev/null 2>&1 && \
-       busybox mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+       busybox mkfifo "$TARGET_FIFO" 2>> "$LOG_FILE"; then
       FIFO_CREATE_METHOD=busybox-mkfifo
     else
-      rm -f "$RENDER_REQUEST_FIFO"
+      rm -f "$TARGET_FIFO"
       if [ -x /bin/busybox ] && \
-         /bin/busybox mkfifo "$RENDER_REQUEST_FIFO" 2>> "$LOG_FILE"; then
+         /bin/busybox mkfifo "$TARGET_FIFO" 2>> "$LOG_FILE"; then
         FIFO_CREATE_METHOD=/bin/busybox-mkfifo
       else
-        rm -f "$RENDER_REQUEST_FIFO"
+        rm -f "$TARGET_FIFO"
         if command -v mknod >/dev/null 2>&1 && \
-           mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+           mknod "$TARGET_FIFO" p 2>> "$LOG_FILE"; then
           FIFO_CREATE_METHOD=mknod
         else
-          rm -f "$RENDER_REQUEST_FIFO"
+          rm -f "$TARGET_FIFO"
           if command -v busybox >/dev/null 2>&1 && \
-             busybox mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+             busybox mknod "$TARGET_FIFO" p 2>> "$LOG_FILE"; then
             FIFO_CREATE_METHOD=busybox-mknod
           elif [ -x /bin/busybox ] && \
-               /bin/busybox mknod "$RENDER_REQUEST_FIFO" p 2>> "$LOG_FILE"; then
+               /bin/busybox mknod "$TARGET_FIFO" p 2>> "$LOG_FILE"; then
             FIFO_CREATE_METHOD=/bin/busybox-mknod
           fi
         fi
@@ -281,10 +291,18 @@ create_render_request_fifo() {
     fi
   fi
 
-  if [ -z "$FIFO_CREATE_METHOD" ] || [ ! -p "$RENDER_REQUEST_FIFO" ]; then
-    rm -f "$RENDER_REQUEST_FIFO"
+  if [ -z "$FIFO_CREATE_METHOD" ] || [ ! -p "$TARGET_FIFO" ]; then
+    rm -f "$TARGET_FIFO"
     return 1
   fi
+  return 0
+}
+
+create_render_request_fifo() {
+  if ! create_fifo_file "$RENDER_REQUEST_FIFO"; then
+    return 1
+  fi
+  create_fifo_file "$RENDER_REPLY_FIFO" || rm -f "$RENDER_REPLY_FIFO"
   log_message "persistent renderer pipe ready: method=$FIFO_CREATE_METHOD"
   return 0
 }
@@ -307,16 +325,24 @@ ping_render_server() {
 
 start_render_server() {
   RENDER_SERVER_READY=0
-  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO"
+  RENDER_REPLY_READY=0
+  rm -f "$RENDER_SERVER_PID_FILE" "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO"
   if ! create_render_request_fifo; then
     log_message "persistent renderer unavailable: all FIFO creation methods failed"
     return 1
   fi
 
-  (
-    cd /mnt/us/koreader || exit 1
-    exec ./luajit "$SRC_DIR/render_server.lua" < "$RENDER_REQUEST_FIFO"
-  ) >> "$LOG_FILE" 2>&1 &
+  if [ -p "$RENDER_REPLY_FIFO" ]; then
+    (
+      cd /mnt/us/koreader || exit 1
+      exec ./luajit "$SRC_DIR/render_server.lua" "$RENDER_REPLY_FIFO"
+    ) < "$RENDER_REQUEST_FIFO" 3> "$RENDER_REPLY_FIFO" >> "$LOG_FILE" 2>&1 &
+  else
+    (
+      cd /mnt/us/koreader || exit 1
+      exec ./luajit "$SRC_DIR/render_server.lua" < "$RENDER_REQUEST_FIFO"
+    ) >> "$LOG_FILE" 2>&1 &
+  fi
   RENDER_SERVER_PID=$!
   echo "$RENDER_SERVER_PID" > "$RENDER_SERVER_PID_FILE"
 
@@ -326,6 +352,11 @@ start_render_server() {
     log_message "persistent renderer unavailable: could not open request pipe"
     stop_render_server
     return 1
+  fi
+  if [ -p "$RENDER_REPLY_FIFO" ]; then
+    if exec 9<"$RENDER_REPLY_FIFO"; then
+      RENDER_REPLY_READY=1
+    fi
   fi
   if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
     log_message "persistent renderer exited during startup"
@@ -373,7 +404,7 @@ cleanup() {
     "$PID_FILE" "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
     "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
-    "$RENDER_REQUEST_FIFO" "$CURRENT_FRAME" "$NEXT_FRAME" \
+    "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO" "$CURRENT_FRAME" "$NEXT_FRAME" \
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
 }
@@ -440,11 +471,27 @@ update_adaptive_drift_trim() {
   done < "$SYNC_STAT_FILE"
   rm -f "$SYNC_STAT_FILE"
 
+  if ! is_uint "$ACCUMULATED_SLEPT_SECONDS" || [ "$ACCUMULATED_SLEPT_SECONDS" -le 0 ]; then
+    if [ -r "$RUNTIME_DIR/accumulated_slept" ]; then
+      read -r ACCUMULATED_SLEPT_SECONDS < "$RUNTIME_DIR/accumulated_slept" 2>/dev/null || true
+    fi
+  fi
+  is_uint "$ACCUMULATED_SLEPT_SECONDS" || ACCUMULATED_SLEPT_SECONDS=0
+  EFFECTIVE_SLEPT_SEC="$ACCUMULATED_SLEPT_SECONDS"
+  ACCUMULATED_SLEPT_SECONDS=0
+  rm -f "$RUNTIME_DIR/accumulated_slept"
+
   is_uint "$ELAPSED_SEC" || return 0
   [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 28800 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
   [ "${OFFSET_MS#-}" -le 120000 ] || return 0
+
+  # When actual RTC suspend duration is tracked, compute residual drift rate
+  # against actual sleep seconds rather than total wall-clock elapsed time.
+  if [ "$EFFECTIVE_SLEPT_SEC" -ge 300 ] && [ "$EFFECTIVE_SLEPT_SEC" -le 28800 ]; then
+    DRIFT_PPM=$(( (-OFFSET_MS * 1000) / EFFECTIVE_SLEPT_SEC ))
+  fi
 
   # DRIFT_PPM is the residual rate observed while the previous effective PPM
   # was active: positive means the clock still ran fast.
@@ -467,7 +514,9 @@ update_adaptive_drift_trim() {
   [ "$ADAPT_STEP" -gt 10000 ] && ADAPT_STEP=10000
   [ "$ADAPT_STEP" -lt -10000 ] && ADAPT_STEP=-10000
 
-  CURRENT_VOLT=$(get_battery_voltage)
+  CURRENT_VOLT=""
+  [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
+  is_uint "$CURRENT_VOLT" || CURRENT_VOLT=$(get_battery_voltage)
   if is_uint "$CURRENT_VOLT" && [ "$CURRENT_VOLT" -lt 3600 ]; then
     # Low-voltage regime damping: limit single-step trim adjustment to +/- 500 PPM
     # to prevent low-voltage crystal frequency drop from poisoning converged trim
@@ -490,20 +539,22 @@ update_adaptive_drift_trim() {
   echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
   [ -n "$TRIM_PERSIST_FILE" ] && echo "$ADAPTIVE_PPM_TRIM" > "$TRIM_PERSIST_FILE" 2>/dev/null
   NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
-  log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
+  log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s slept=${EFFECTIVE_SLEPT_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
 }
 
 restore_persistent_adaptive_trim() {
   [ "$AUTO_DRIFT_CALIBRATION" = "1" ] || return 0
   if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
-    TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
+    TRIM_VAL=""
+    read -r TRIM_VAL < "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null || true
     if is_uint "${TRIM_VAL#-}"; then
       ADAPTIVE_PPM_TRIM="$TRIM_VAL"
       return 0
     fi
   fi
   if [ -n "$TRIM_PERSIST_FILE" ] && [ -r "$TRIM_PERSIST_FILE" ]; then
-    TRIM_VAL=$(cat "$TRIM_PERSIST_FILE" 2>/dev/null)
+    TRIM_VAL=""
+    read -r TRIM_VAL < "$TRIM_PERSIST_FILE" 2>/dev/null || true
     if is_uint "${TRIM_VAL#-}"; then
       ADAPTIVE_PPM_TRIM="$TRIM_VAL"
       echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null
@@ -537,14 +588,16 @@ is_battery_charging() {
   CHARGING=$(/usr/bin/lipc-get-prop com.lab126.powerd isCharging 2>/dev/null)
   [ "$CHARGING" = "1" ] && return 0
   if [ -r /sys/devices/system/yoshi_battery/yoshi_battery0/charging ]; then
-    CHARGING=$(cat /sys/devices/system/yoshi_battery/yoshi_battery0/charging 2>/dev/null)
+    CHARGING=""
+    read -r CHARGING < /sys/devices/system/yoshi_battery/yoshi_battery0/charging 2>/dev/null || true
     [ "$CHARGING" = "1" ] && return 0
   fi
   return 1
 }
 
 get_battery_level() {
-  VOLT=$(get_battery_voltage)
+  VOLT="${1:-}"
+  [ -n "$VOLT" ] || VOLT=$(get_battery_voltage)
   if [ -n "$VOLT" ]; then
     LEVEL=$(calc_battery_from_voltage "$VOLT")
     if is_uint "$LEVEL"; then
@@ -590,7 +643,8 @@ next_minute_epoch() {
 }
 read_pmic_epoch() {
   [ -r "$RTC_PMIC_EPOCH_PATH" ] || return 1
-  PMIC_HEX=$(cat "$RTC_PMIC_EPOCH_PATH" 2>/dev/null)
+  PMIC_HEX=""
+  read -r PMIC_HEX < "$RTC_PMIC_EPOCH_PATH" 2>/dev/null || return 1
   case "$PMIC_HEX" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
   PMIC_EPOCH=$((0x$PMIC_HEX))
   [ "$PMIC_EPOCH" -gt 0 ] || return 1
@@ -604,11 +658,13 @@ scheduler_now() {
 }
 
 monotonic_stamp() {
-  UPTIME_VALUE=$(cat /proc/uptime 2>/dev/null)
+  UPTIME_VALUE=""
+  read -r UPTIME_VALUE _ < /proc/uptime 2>/dev/null || true
   echo "${UPTIME_VALUE%% *}"
 }
 monotonic_centiseconds() {
-  UPTIME_VALUE=$(cat /proc/uptime 2>/dev/null)
+  UPTIME_VALUE=""
+  read -r UPTIME_VALUE _ < /proc/uptime 2>/dev/null || return 1
   UPTIME_VALUE=${UPTIME_VALUE%% *}
   case "$UPTIME_VALUE" in
     *.*) ;;
@@ -617,7 +673,8 @@ monotonic_centiseconds() {
   UPTIME_SECONDS=${UPTIME_VALUE%%.*}
   UPTIME_FRACTION=${UPTIME_VALUE#*.}
   is_uint "$UPTIME_SECONDS" || return 1
-  UPTIME_FRACTION=$(printf '%.2s' "${UPTIME_FRACTION}00")
+  UPTIME_FRACTION="${UPTIME_FRACTION}00"
+  UPTIME_FRACTION="${UPTIME_FRACTION%"${UPTIME_FRACTION#??}"}"
   is_uint "$UPTIME_FRACTION" || return 1
   echo $((UPTIME_SECONDS * 100 + 1$UPTIME_FRACTION - 100))
 }
@@ -626,9 +683,26 @@ format_monotonic_centiseconds() {
   is_uint "$FORMAT_CS" || { echo unknown; return 1; }
   printf '%s.%02d' "$((FORMAT_CS / 100))" "$((FORMAT_CS % 100))"
 }
+run_sleep_ms_renderer() {
+  SLEEP_REQ_MS="$1"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  ! next_render_in_progress || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+  if ! (printf 'SLEEP_MS\t%s\t%s\n' "$STATUS_PATH" "$SLEEP_REQ_MS" >&8) 2>/dev/null; then
+    return 1
+  fi
+  wait_renderer_reply "$STATUS_PATH" >/dev/null 2>&1
+}
 sleep_ms() {
   DELAY_MS="$1"
   [ "$DELAY_MS" -gt 0 ] || return 0
+
+  if run_sleep_ms_renderer "$DELAY_MS"; then
+    return 0
+  fi
 
   DELAY_US=$((DELAY_MS * 1000))
   if command -v usleep >/dev/null 2>&1; then
@@ -685,6 +759,29 @@ select_refresh_profile() {
     REFRESH_DURATION_MS="$FULL_REFRESH_DURATION_MS"
   fi
 }
+run_wait_until_renderer() {
+  WAIT_TARGET_EPOCH="$1"
+  WAIT_LEAD_MS="$2"
+  [ "$RENDER_SERVER_READY" = "1" ] || return 1
+  ! next_render_in_progress || return 1
+  [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
+  RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
+  STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
+  rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
+  if ! (printf 'WAIT_UNTIL\t%s\t%s\t%s\n' "$STATUS_PATH" "$WAIT_TARGET_EPOCH" "$WAIT_LEAD_MS" >&8) 2>/dev/null; then
+    return 1
+  fi
+  if wait_renderer_reply "$STATUS_PATH"; then
+    WAIT_DETAIL=${SERVER_REPLY#OK WAIT }
+    set -- $WAIT_DETAIL
+    if is_uint "${1:-}" && [ "${1:-0}" -gt 0 ]; then
+      REFRESH_BOUNDARY_UPTIME_CS="$1"
+      REFRESH_PLANNED_START_UPTIME_CS="${2:-$1}"
+    fi
+    return 0
+  fi
+  return 1
+}
 prepare_refresh_release() {
   RELEASE_NOW_CLOCK="$1"
   is_uint "$RELEASE_NOW_CLOCK" || return 1
@@ -693,6 +790,11 @@ prepare_refresh_release() {
     REFRESH_SCHEDULE_EPOCH="$NEXT_FRAME_EPOCH"
     REFRESH_BOUNDARY_UPTIME_CS=""
     REFRESH_PLANNED_START_UPTIME_CS=""
+  fi
+  REFRESH_HALF_MS=$((REFRESH_DURATION_MS / 2))
+  if run_wait_until_renderer "$NEXT_DISPLAY_CLOCK" "$REFRESH_HALF_MS"; then
+    log_debug "refresh schedule (ffi): target=$NEXT_FRAME_EPOCH profile=$REFRESH_PROFILE_KIND estimate_ms=$REFRESH_DURATION_MS start_uptime=$(format_monotonic_centiseconds "$REFRESH_PLANNED_START_UPTIME_CS") boundary_uptime=$(format_monotonic_centiseconds "$REFRESH_BOUNDARY_UPTIME_CS")"
+    return 0
   fi
   if ! is_uint "$REFRESH_BOUNDARY_UPTIME_CS"; then
     RELEASE_SAMPLE_CS=$(monotonic_centiseconds) || return 1
@@ -741,20 +843,26 @@ wait_renderer_reply() {
   STATUS_PATH="$1"
   [ "$RENDER_SERVER_READY" = "1" ] || return 1
   [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
-  SERVER_WAIT_DEADLINE=$(($(date +%s) + 30))
-  while [ ! -f "$STATUS_PATH" ]; do
-    if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
-      return 1
-    fi
-    SERVER_WAIT_NOW=$(date +%s)
-    if [ "$SERVER_WAIT_NOW" -ge "$SERVER_WAIT_DEADLINE" ]; then
-      log_message "persistent renderer timed out; stopping server before fallback"
-      kill "$RENDER_SERVER_PID" 2>/dev/null
-      return 1
-    fi
-    pause_briefly
-  done
-  SERVER_REPLY=$(cat "$STATUS_PATH" 2>/dev/null)
+  if [ "$RENDER_REPLY_READY" = "1" ] && [ ! -f "$STATUS_PATH" ]; then
+    read -r _ <&9 || true
+  fi
+  if [ ! -f "$STATUS_PATH" ]; then
+    SERVER_WAIT_DEADLINE=$(($(date +%s) + 30))
+    while [ ! -f "$STATUS_PATH" ]; do
+      if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
+        return 1
+      fi
+      SERVER_WAIT_NOW=$(date +%s)
+      if [ "$SERVER_WAIT_NOW" -ge "$SERVER_WAIT_DEADLINE" ]; then
+        log_message "persistent renderer timed out; stopping server before fallback"
+        kill "$RENDER_SERVER_PID" 2>/dev/null
+        return 1
+      fi
+      sleep 1
+    done
+  fi
+  SERVER_REPLY=""
+  read -r SERVER_REPLY < "$STATUS_PATH" 2>/dev/null || true
   rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
   case "$SERVER_REPLY" in
     OK|OK\ *) return 0 ;;
@@ -768,14 +876,17 @@ adjust_system_time() {
   is_uint "${OFFSET_SEC#-}" || return 1
   [ "$OFFSET_SEC" -eq 0 ] && return 0
 
-  if [ "$RENDER_SERVER_READY" = "1" ]; then
+  if [ "$RENDER_SERVER_READY" = "1" ] && [ -n "$RENDER_SERVER_PID" ] && \
+     kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
     RENDER_REQUEST_SEQUENCE=$((RENDER_REQUEST_SEQUENCE + 1))
-    STATUS_PATH="$RUNTIME_DIR/render-status-$RENDER_REQUEST_SEQUENCE"
+    STATUS_PATH="$RUNTIME_DIR/render-status-$$-$RENDER_REQUEST_SEQUENCE"
     rm -f "$STATUS_PATH" "$STATUS_PATH.tmp"
-    printf 'ADJUST\t%s\t%s\n' "$STATUS_PATH" "$OFFSET_SEC" > "$RENDER_REQUEST_FIFO" 2>/dev/null
-    wait_renderer_reply "$STATUS_PATH" 500 >/dev/null 2>&1
+    if (printf 'ADJUST\t%s\t%s\n' "$STATUS_PATH" "$OFFSET_SEC" >&8) 2>/dev/null && \
+       wait_renderer_reply "$STATUS_PATH" >/dev/null 2>&1; then
+      rm -f "$STATUS_PATH"
+      return 0
+    fi
     rm -f "$STATUS_PATH"
-    return 0
   fi
 
   if [ -x /mnt/us/koreader/luajit ]; then
@@ -979,8 +1090,8 @@ start_next_frame_render() {
   else
     if [ "$NEXT_RENDER_MINUTE" -eq 0 ]; then
       # Sample quiet OCV battery before top-of-the-hour full refresh
-      BATTERY_LEVEL=$(get_battery_level)
       CURRENT_VOLT=$(get_battery_voltage)
+      BATTERY_LEVEL=$(get_battery_level "$CURRENT_VOLT")
       if [ -n "$CURRENT_VOLT" ]; then
         echo "$CURRENT_VOLT" > "$RUNTIME_DIR/battery.volt"
         log_debug "pre-hourly OCV battery sample: level=${BATTERY_LEVEL}% (${CURRENT_VOLT}mV)"
@@ -1017,23 +1128,41 @@ start_next_frame_render() {
      [ "$RENDER_SERVER_READY" = "1" ] && [ ! -f "$PARTIAL_DISABLED_FILE" ]; then
     PARTIAL_ELIGIBLE=1
   fi
-  (
-    if [ "$PARTIAL_ELIGIBLE" = "1" ] && \
-       prepare_partial_frame "$NEXT_RENDER_STATUS_PATH" "$ORIENTATION" "$THEME" \
+  if [ "$PARTIAL_ELIGIBLE" = "1" ]; then
+    if prepare_partial_frame "$NEXT_RENDER_STATUS_PATH" "$ORIENTATION" "$THEME" \
          "$CURRENT_FRAME_EPOCH" "$NEXT_FRAME_RENDER_EPOCH" "$HOUR_MODE"; then
-      echo "partial $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY ${PARTIAL_CHANGED_COUNT:-1}" > "$NEXT_RENDER_RESULT"
+      is_uint "$PARTIAL_CHANGED_COUNT" || PARTIAL_CHANGED_COUNT=1
+      NEXT_FRAME_KIND=partial
+      NEXT_FRAME_CHANGED_DIGITS="$PARTIAL_CHANGED_COUNT"
+      echo "$NEXT_FRAME_KIND $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY $NEXT_FRAME_CHANGED_DIGITS" > "$NEXT_FRAME_META"
+      NEXT_FRAME_READY=1
+      log_debug "next-minute frame ready: kind=$NEXT_FRAME_KIND target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
+      return 0
+    fi
+    log_message "partial preparation unavailable; pre-rendering full PNG fallback"
+    touch "$PARTIAL_DISABLED_FILE"
+  fi
+  if [ "$RENDER_SERVER_READY" = "1" ]; then
+    if run_renderer "$NEXT_RENDER_STATUS_PATH" "$NEXT_FRAME" \
+      "$ORIENTATION" "$THEME" "$NEXT_FRAME_RENDER_EPOCH" "$NEXT_FRAME_BATTERY" \
+      "$HELP_VISIBLE" "$HOUR_MODE" && [ -s "$NEXT_FRAME" ]; then
+      NEXT_FRAME_KIND=png
+      NEXT_FRAME_CHANGED_DIGITS=0
+      echo "$NEXT_FRAME_KIND $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY 0" > "$NEXT_FRAME_META"
+      NEXT_FRAME_READY=1
+      log_debug "next-minute frame ready: kind=$NEXT_FRAME_KIND target=$NEXT_FRAME_RENDER_EPOCH battery=$NEXT_FRAME_BATTERY"
+      return 0
+    fi
+    log_message "next-minute renderer failed"
+    return 1
+  fi
+  (
+    if run_renderer "$NEXT_RENDER_STATUS_PATH" "$NEXT_RENDER_WORK" \
+      "$ORIENTATION" "$THEME" "$NEXT_FRAME_RENDER_EPOCH" "$NEXT_FRAME_BATTERY" \
+      "$HELP_VISIBLE" "$HOUR_MODE" && [ -s "$NEXT_RENDER_WORK" ]; then
+      echo "png $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY 0" > "$NEXT_RENDER_RESULT"
     else
-      if [ "$PARTIAL_ELIGIBLE" = "1" ]; then
-        log_message "partial preparation unavailable; pre-rendering full PNG fallback"
-        touch "$PARTIAL_DISABLED_FILE"
-      fi
-      if run_renderer "$NEXT_RENDER_STATUS_PATH" "$NEXT_RENDER_WORK" \
-        "$ORIENTATION" "$THEME" "$NEXT_FRAME_RENDER_EPOCH" "$NEXT_FRAME_BATTERY" \
-        "$HELP_VISIBLE" "$HOUR_MODE" && [ -s "$NEXT_RENDER_WORK" ]; then
-        echo "png $NEXT_FRAME_RENDER_EPOCH $NEXT_FRAME_BATTERY 0" > "$NEXT_RENDER_RESULT"
-      else
-        false
-      fi
+      false
     fi
   ) &
   NEXT_RENDER_PID=$!
@@ -1121,6 +1250,9 @@ watch_keys() {
   done
 }
 pause_briefly() {
+  if run_sleep_ms_renderer 100; then
+    return 0
+  fi
   if command -v usleep >/dev/null 2>&1; then
     usleep 100000
   else
@@ -1161,7 +1293,9 @@ refresh_battery_sample_after_hourly_full_refresh() {
         fi
       fi
       if [ "$INTERVAL_DUE" = "1" ]; then
-        CURRENT_SYNC_VOLT=$(get_battery_voltage)
+        CURRENT_SYNC_VOLT=""
+        [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_SYNC_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
+        is_uint "$CURRENT_SYNC_VOLT" || CURRENT_SYNC_VOLT=$(get_battery_voltage)
         if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
           log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
         else
@@ -1173,7 +1307,9 @@ refresh_battery_sample_after_hourly_full_refresh() {
   if [ "$AUTO_SYNC_DUE" = "1" ]; then
     start_time_sync "auto"
   elif [ "$AUTO_TIME_CHECK_HOURLY" = "1" ] && [ -z "$SYNC_PID" ]; then
-    CURRENT_SYNC_VOLT=$(get_battery_voltage)
+    CURRENT_SYNC_VOLT=""
+    [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_SYNC_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
+    is_uint "$CURRENT_SYNC_VOLT" || CURRENT_SYNC_VOLT=$(get_battery_voltage)
     if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
       log_message "auto time check skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
     else
@@ -1206,8 +1342,8 @@ refresh_battery_sample_after_hourly_full_refresh() {
   done
 
   [ -f "$EXIT_FILE" ] && return 1
-  FRESH_BATTERY_LEVEL=$(get_battery_level)
   FRESH_BATTERY_VOLT=$(get_battery_voltage)
+  FRESH_BATTERY_LEVEL=$(get_battery_level "$FRESH_BATTERY_VOLT")
   VOLT_MSG=""
   if [ -n "$FRESH_BATTERY_VOLT" ]; then
     VOLT_MSG=" (${FRESH_BATTERY_VOLT}mV)"
@@ -1231,7 +1367,8 @@ try_rtc_suspend() {
   SUSPEND_SECONDS=$((EXPECTED_WAKE_SYSTEM - SUSPEND_START_SYSTEM))
   # Very short RTC alarms are unreliable on K4NT; stay awake instead.
   [ "$SUSPEND_SECONDS" -ge 2 ] || return 1
-  RTC_STATE=$(cat "$RTC_PATH" 2>/dev/null)
+  RTC_STATE=""
+  read -r RTC_STATE < "$RTC_PATH" 2>/dev/null || return 1
   [ "$RTC_STATE" = "0" ] || return 1
 
   # Set hardware alarm countdown to exact planned suspend duration
@@ -1254,10 +1391,16 @@ try_rtc_suspend() {
 
     # Calculate exact drift accrued during actual sleep time and set back system clock
     ACTUAL_SLEPT_SECONDS=$((RESUME_SYSTEM - SUSPEND_START_SYSTEM))
+    if [ "$ACTUAL_SLEPT_SECONDS" -gt 0 ]; then
+      is_uint "$ACCUMULATED_SLEPT_SECONDS" || ACCUMULATED_SLEPT_SECONDS=0
+      ACCUMULATED_SLEPT_SECONDS=$((ACCUMULATED_SLEPT_SECONDS + ACTUAL_SLEPT_SECONDS))
+      echo "$ACCUMULATED_SLEPT_SECONDS" > "$RUNTIME_DIR/accumulated_slept" 2>/dev/null || true
+    fi
     CURRENT_VOLT=""
-    [ -f "$RUNTIME_DIR/battery.volt" ] && CURRENT_VOLT=$(cat "$RUNTIME_DIR/battery.volt" 2>/dev/null)
+    [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
     if [ -r "$RUNTIME_DIR/adaptive_ppm.trim" ]; then
-      TRIM_VAL=$(cat "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null)
+      TRIM_VAL=""
+      read -r TRIM_VAL < "$RUNTIME_DIR/adaptive_ppm.trim" 2>/dev/null || true
       is_uint "${TRIM_VAL#-}" && ADAPTIVE_PPM_TRIM="$TRIM_VAL"
     fi
     EFFECTIVE_PPM=$(calc_effective_ppm "$CURRENT_VOLT" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
@@ -1292,7 +1435,8 @@ wait_for_event_or_minute() {
 
   while [ ! -f "$EXIT_FILE" ]; do
     if [ -f "$KEY_EVENT_FILE" ]; then
-      KEY_ACTION=$(cat "$KEY_EVENT_FILE" 2>/dev/null)
+      KEY_ACTION=""
+      read -r KEY_ACTION < "$KEY_EVENT_FILE" 2>/dev/null || true
       rm -f "$KEY_EVENT_FILE"
       WAIT_REASON="key"
       return
@@ -1321,8 +1465,13 @@ wait_for_event_or_minute() {
       log_message "virtual clock catch-up: now=$NOW_CLOCK next_target=$NEXT_FRAME_EPOCH next_display_clock=$NEXT_DISPLAY_CLOCK"
       continue
     fi
-    REFRESH_REFERENCE_CLOCK=$((NEXT_DISPLAY_CLOCK - 1))
+    REFRESH_LEAD_SECONDS="$RTC_WAKE_LEAD_SECONDS"
+    [ "$RENDER_SERVER_READY" = "1" ] || REFRESH_LEAD_SECONDS=1
+    REFRESH_REFERENCE_CLOCK=$((NEXT_DISPLAY_CLOCK - REFRESH_LEAD_SECONDS))
     if [ "$NOW_CLOCK" -ge "$REFRESH_REFERENCE_CLOCK" ]; then
+      if next_render_in_progress; then
+        finish_next_frame_render || true
+      fi
       prepare_refresh_release "$NOW_CLOCK" || true
       REFRESH_ACTUAL_CLOCK=$(scheduler_now 2>/dev/null)
       if [ "$DEBUG_LOG" = "1" ]; then
@@ -1422,7 +1571,7 @@ start_time_sync() {
 }
 finish_time_sync() {
   SYNC_STATUS=failure
-  [ -f "$SYNC_RESULT_FILE" ] && SYNC_STATUS=$(cat "$SYNC_RESULT_FILE" 2>/dev/null)
+  [ -f "$SYNC_RESULT_FILE" ] && read -r SYNC_STATUS < "$SYNC_RESULT_FILE" 2>/dev/null || true
   [ -n "$SYNC_PID" ] && wait "$SYNC_PID" 2>/dev/null
   SYNC_PID=""
   rm -f "$SYNC_PID_FILE" "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP"
@@ -1499,8 +1648,8 @@ main() {
     "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
     "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
-    "$RENDER_REQUEST_FIFO" "$PARTIAL_DISABLED_FILE" \
-    "$RUNTIME_DIR"/render-status-*
+    "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO" "$PARTIAL_DISABLED_FILE" \
+    "$RUNTIME_DIR/accumulated_slept" "$RUNTIME_DIR"/render-status-*
   load_settings
   restore_persistent_adaptive_trim
   start_new_session_log
@@ -1618,8 +1767,10 @@ main() {
       minute)
         publish_minute_frame
         advance_virtual_clock
-        if truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"; then
-          log_message "log truncated at ${LOG_MAX_BYTES} bytes"
+        if [ $(((CURRENT_FRAME_EPOCH / 60) % 60)) -eq 0 ]; then
+          if truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"; then
+            log_message "log truncated at ${LOG_MAX_BYTES} bytes"
+          fi
         fi
         prepare_next_minute
         refresh_battery_sample_after_hourly_full_refresh || true

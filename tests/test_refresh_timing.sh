@@ -13,11 +13,19 @@ save_settings() { :; }
 SETTINGS_VERSION=3
 RTC_WAKE_LEAD_SECONDS=2
 load_settings
-[ "$SETTINGS_VERSION" = 7 ]
-[ "$RTC_WAKE_LEAD_SECONDS" = 2 ]
+[ "$SETTINGS_VERSION" = 8 ]
+[ "$RTC_WAKE_LEAD_SECONDS" = 1 ]
 [ "$AUTO_DRIFT_CALIBRATION" = 1 ]
 [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 0 ]
 [ "$BATTERY_REFRESH_SETTLE_SECONDS" = 0 ]
+
+SETTINGS_VERSION=7
+RTC_WAKE_LEAD_SECONDS=2
+AUTO_TIME_SYNC_INTERVAL_HOURS=4
+load_settings
+[ "$SETTINGS_VERSION" = 8 ]
+[ "$RTC_WAKE_LEAD_SECONDS" = 1 ]
+[ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 6 ]
 
 NEXT_FRAME_EPOCH=120
 NEXT_DISPLAY_CLOCK=120
@@ -250,6 +258,48 @@ render_current_frame
 [ "$CURRENT_FRAME_BATTERY" = 82 ]
 [ "$BATTERY_LEVEL" = 82 ]
 
+# Test ACCUMULATED_SLEPT_SECONDS denominator in update_adaptive_drift_trim
+# OFFSET_MS=-1800ms over ELAPSED_SEC=3600s (naive 500ppm), but actual sleep was 1800s -> true residual is 1000ppm -> 50% step = +500ppm
+get_battery_voltage() { echo 4000; }
+rm -f "$RUNTIME_DIR/battery.volt"
+ADAPTIVE_PPM_TRIM=0
+ACCUMULATED_SLEPT_SECONDS=1800
+printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "500" ]
+[ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
+
+# Test synchronous partial pre-render when PARTIAL_ELIGIBLE=1 (zero background subshell fork)
+RENDER_SERVER_READY=1
+HELP_VISIBLE=0
+CURRENT_FRAME_EPOCH=3600
+NEXT_FRAME_EPOCH=3660
+CURRENT_FRAME_BATTERY=82
+NEXT_RENDER_PID=""
+rm -f "$PARTIAL_DISABLED_FILE"
+prepare_partial_frame() {
+  PARTIAL_CHANGED_COUNT=2
+  return 0
+}
+start_next_frame_render
+[ -z "$NEXT_RENDER_PID" ]
+[ "$NEXT_FRAME_READY" = 1 ]
+[ "$NEXT_FRAME_KIND" = "partial" ]
+[ "$NEXT_FRAME_CHANGED_DIGITS" = "2" ]
+[ "$(cat "$NEXT_FRAME_META")" = "partial 3660 82 2" ]
+
+# Test WAIT_UNTIL FFI boundary assignment in prepare_refresh_release
+run_wait_until_renderer() {
+  REFRESH_BOUNDARY_UPTIME_CS=7500
+  REFRESH_PLANNED_START_UPTIME_CS=7460
+  return 0
+}
+REFRESH_SCHEDULE_EPOCH=0
+prepare_refresh_release 3659
+[ "$REFRESH_BOUNDARY_UPTIME_CS" = "7500" ]
+[ "$REFRESH_PLANNED_START_UPTIME_CS" = "7460" ]
+
 rm -rf "$RUNTIME_DIR"
 
 printf 'refresh timing tests passed\n'
+

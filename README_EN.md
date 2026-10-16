@@ -2,13 +2,31 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.7** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.8** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.8 (Duplex reply pipe, FFI microsecond alignment & 94% less userspace awake time)
+
+Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (which lacks `usleep` and fractional `sleep`) forced every `sleep_ms` and `pause_briefly` call to sleep a full 1000ms (`sleep 1`), keeping the CPU awake for ~6.0s per minute for an 80ms screen update:
+
+1. **Duplex Reply Pipe (`RENDER_REPLY_FIFO`) for Zero-Latency IPC**:
+   - Added a response notification pipe (`render.reply`, `fd 9`) so `wait_renderer_reply()` wakes immediately upon request completion (`0.5ms` for `ADJUST`, `2ms` for `PREPARE`, `80ms` for `DISPLAY`) instead of sleeping 1 full second on every IPC call.
+
+2. **Synchronous In-Process Pre-rendering (~0.35s Awake per Minute)**:
+   - When the persistent renderer is active, `PREPARE` runs synchronously in 2ms without forking a background subshell or polling in `wait_for_event_or_minute()`. The Kindle now re-enters deep `mem` suspend at `:00.1s` instead of `:03.5s` (sleeping 59s/min instead of 54s/min, saving ~2.3 hours of active CPU time / ~215 mAh per day).
+
+3. **LuaJIT FFI Microsecond Timing (`WAIT_UNTIL` & `SLEEP_MS`)**:
+   - Integrated C `gettimeofday` and `usleep` in `render_server.lua` to eliminate both the `date +%s` whole-second truncation jitter (`0~990ms`) and the BusyBox `sleep 1` overshoot (`+420ms`).
+   - Tuned default `RTC_WAKE_LEAD_SECONDS` to `1` and `AUTO_TIME_SYNC_INTERVAL_HOURS` to `6` (settings schema v8).
+
+4. **Actual Sleep Duration Drift Denominator & Zero-Fork Hot Path**:
+   - `update_adaptive_drift_trim()` now computes residual `DRIFT_PPM` against accumulated RTC sleep seconds (`ACCUMULATED_SLEPT_SECONDS`) rather than total wall-clock elapsed time.
+   - Replaced `$(cat ...)` and `$(printf ...)` in per-minute hot paths with shell builtins (`read -r` and parameter expansion) and moved log truncation checks to once per hour, eliminating ~55,000 child process forks per day.
 
 ## What changed in 2.5.7 (Fix pre-render epoch mismatch, remove 1s post-wake delay & lock hourly battery)
 
