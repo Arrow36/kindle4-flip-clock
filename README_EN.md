@@ -23,9 +23,10 @@ Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (
 
 3. **LuaJIT FFI Microsecond Timing (`WAIT_UNTIL` & `SLEEP_MS`) & Short-Alarm Guard**:
    - Integrated C `gettimeofday` and `usleep` in `render_server.lua` to eliminate both the `date +%s` whole-second truncation jitter (`0~990ms`) and the BusyBox `sleep 1` overshoot (`+420ms`).
-   - Preserved `RTC_WAKE_LEAD_SECONDS=2` to absorb hardware wake jitter, raised minimum RTC suspend threshold from `2s` to `5s` to avoid `mxc_rtc.0` short-alarm stalls, and tuned default `AUTO_TIME_SYNC_INTERVAL_HOURS` to `6` (settings schema v8).
+   - Preserved `RTC_WAKE_LEAD_SECONDS=2` to absorb hardware wake jitter and raised minimum RTC suspend threshold from `2s` to `5s` to avoid `mxc_rtc.0` short-alarm stalls.
 
-4. **Actual Sleep Duration Drift Denominator & Zero-Fork Hot Path**:
+4. **Convergence-Gated Auto-Sync Interval (`DRIFT_CONVERGED_STREAK`), Actual Sleep Denominator & Zero-Fork Hot Path**:
+   - **Hourly Sync Until Converged**: Tracks consecutive accurate syncs (`|DRIFT_PPM| <= 300` and `|OFFSET_MS| <= 2000`) via `DRIFT_CONVERGED_STREAK`. While `< 2`, sync runs every `1` hour to rapidly converge; once `>= 2` consecutive syncs are accurate, it switches to `AUTO_TIME_SYNC_INTERVAL_HOURS` (`6` hours default) and reverts to `1` hour if drift exceeds bounds later.
    - `update_adaptive_drift_trim()` now computes residual `DRIFT_PPM` against accumulated RTC sleep seconds (`ACCUMULATED_SLEPT_SECONDS`) rather than total wall-clock elapsed time.
    - Replaced `$(cat ...)` and `$(printf ...)` in per-minute hot paths with shell builtins (`read -r` and parameter expansion) and moved log truncation checks to once per hour, eliminating ~55,000 child process forks per day.
 

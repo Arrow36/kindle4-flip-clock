@@ -193,7 +193,29 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
-# Case 4: Interval=2, 1 hour later at 20:00 (not due)
+# Case 4: Unconverged (DRIFT_CONVERGED_STREAK < 2) forces 1h sync even when AUTO_TIME_SYNC_INTERVAL_HOURS=6
+AUTO_TIME_SYNC_INTERVAL_HOURS=6
+DRIFT_CONVERGED_STREAK=0
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_SYNC_EPOCH=3600
+SYNC_PID=""
+scheduler_now() { echo 7200; }
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
+
+# Two consecutive accurate syncs (|DRIFT_PPM| <= 300 and |OFFSET_MS| <= 2000) reach DRIFT_CONVERGED_STREAK=2
+printf "OFFSET_MS=-360\nELAPSED_SEC=3600\nDRIFT_PPM=100\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$DRIFT_CONVERGED_STREAK" = 1 ]
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = 1 ]
+
+printf "OFFSET_MS=180\nELAPSED_SEC=3600\nDRIFT_PPM=-50\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$DRIFT_CONVERGED_STREAK" = 2 ]
+
+# Case 5: Converged (DRIFT_CONVERGED_STREAK=2), Interval=2: 1 hour later at 20:00 (not due), 2 hours later at 21:00 (due)
 AUTO_TIME_SYNC_INTERVAL_HOURS=2
 LAST_AUTO_SYNC_EPOCH=3600
 LAST_SYNC_EPOCH=3600
@@ -202,13 +224,12 @@ scheduler_now() { echo 7200; }
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 0 ]
 
-# Case 5: Interval=2, 2 hours later at 21:00 (due)
 scheduler_now() { echo 10800; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
-# Case 6: Default interval=4, 3 hours later at 22:00 (not due), 4 hours later at 23:00 (due)
+# Case 6: Converged (DRIFT_CONVERGED_STREAK=2), Interval=4: 3 hours later at 22:00 (not due), 4 hours later at 23:00 (due)
 AUTO_TIME_SYNC_INTERVAL_HOURS=4
 LAST_AUTO_SYNC_EPOCH=3600
 LAST_SYNC_EPOCH=3600
@@ -221,12 +242,13 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
-# Test low-voltage adaptive drift damping (< 3600mV clamped to +/-500)
+# Test low-voltage adaptive drift damping (< 3600mV clamped to +/-500) and streak reset on large drift
 get_battery_voltage() { echo 3500; }
 printf "OFFSET_MS=-7200\nELAPSED_SEC=3600\nDRIFT_PPM=2000\n" > "$SYNC_STAT_FILE"
 ADAPTIVE_PPM_TRIM=0
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "500" ]
+[ "$DRIFT_CONVERGED_STREAK" = "0" ]
 
 # Test monotonic discharge filter (when not charging, sampled 85 > current 80 is capped to 80)
 get_battery_level() { echo 85; }

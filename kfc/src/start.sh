@@ -50,6 +50,7 @@ FULL_REFRESH_DURATION_MS=1400
 BATTERY_REFRESH_SETTLE_SECONDS=0
 LAST_AUTO_SYNC_EPOCH=0
 LAST_SYNC_EPOCH=0
+DRIFT_CONVERGED_STREAK=0
 ACCUMULATED_SLEPT_SECONDS=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
@@ -539,8 +540,14 @@ update_adaptive_drift_trim() {
 
   echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
   [ -n "$TRIM_PERSIST_FILE" ] && echo "$ADAPTIVE_PPM_TRIM" > "$TRIM_PERSIST_FILE" 2>/dev/null
+  is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
+  if [ "$ABS_DRIFT_PPM" -le 300 ] && [ "${OFFSET_MS#-}" -le 2000 ]; then
+    DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
+  else
+    DRIFT_CONVERGED_STREAK=0
+  fi
   NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
-  log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s slept=${EFFECTIVE_SLEPT_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm"
+  log_message "adaptive drift calibration: offset=${OFFSET_MS}ms elapsed=${ELAPSED_SEC}s slept=${EFFECTIVE_SLEPT_SEC}s residual=${DRIFT_PPM}ppm step=${ADAPT_STEP}ppm trim=${ADAPTIVE_PPM_TRIM}ppm next_eff=${NEXT_EFF_PPM}ppm streak=${DRIFT_CONVERGED_STREAK}"
 }
 
 restore_persistent_adaptive_trim() {
@@ -1300,13 +1307,18 @@ refresh_battery_sample_after_hourly_full_refresh() {
     fi
     if [ "$COOLDOWN_ACTIVE" = "0" ]; then
       INTERVAL_DUE=0
-      if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" -eq 1 ]; then
-        # First top-of-the-hour after startup, or hourly sync interval: always due at :00
+      EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
+      is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
+      if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -lt 2 ]; then
+        EFFECTIVE_SYNC_INTERVAL_HOURS=1
+      fi
+      if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -le 1 ]; then
+        # First top-of-the-hour after startup, or unconverged/1h sync interval: always due at :00
         INTERVAL_DUE=1
       elif [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ]; then
         INTERVAL_DUE=1
       else
-        AUTO_SYNC_THRESHOLD_SECONDS=$(( AUTO_TIME_SYNC_INTERVAL_HOURS * 3600 - 300 ))
+        AUTO_SYNC_THRESHOLD_SECONDS=$(( EFFECTIVE_SYNC_INTERVAL_HOURS * 3600 - 300 ))
         [ "$AUTO_SYNC_THRESHOLD_SECONDS" -lt 1800 ] && AUTO_SYNC_THRESHOLD_SECONDS=1800
         if [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
           INTERVAL_DUE=1

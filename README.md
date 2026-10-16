@@ -27,9 +27,10 @@
 
 3. **LuaJIT FFI 微秒级时钟对齐（`WAIT_UNTIL` / `SLEEP_MS`）与防短闹钟假死**
    - **修改理由**：`date +%s` 仅有整秒精度（存在 0~990ms 截断抖动），且 BusyBox `sleep 1` 总是睡过头 420ms。
-   - **技术实现**：在 `render_server.lua` 中接入 C 标准库 `gettimeofday` 与 `usleep`，新增 `WAIT_UNTIL` 与 `SLEEP_MS` 指令，保留实机验证的 `RTC_WAKE_LEAD_SECONDS=2` 吸收硬件唤醒抖动，再以微秒级精度睡眠至 `-400ms` 触发刷屏；同时将最小挂起闹钟门槛提高至 `5` 秒防止 `mxc_rtc.0` 短闹钟假死，默认自动对时间隔 `AUTO_TIME_SYNC_INTERVAL_HOURS` 调优为 `6` 小时。
+   - **技术实现**：在 `render_server.lua` 中接入 C 标准库 `gettimeofday` 与 `usleep`，新增 `WAIT_UNTIL` 与 `SLEEP_MS` 指令，保留实机验证的 `RTC_WAKE_LEAD_SECONDS=2` 吸收硬件唤醒抖动，再以微秒级精度睡眠至 `-400ms` 触发刷屏；同时将最小挂起闹钟门槛提高至 `5` 秒防止 `mxc_rtc.0` 短闹钟假死。
 
-4. **实际休眠时长分母校准与热路径零 Fork 改造**
+4. **动态收敛校时间隔（`DRIFT_CONVERGED_STREAK`）、真实休眠分母与热路径零 Fork**
+   - **多次跑准后再切长间隔**：新增 `DRIFT_CONVERGED_STREAK` 连续收敛计数。未收敛时（连续满足 `|DRIFT_PPM| <= 300` 且 `|OFFSET_MS| <= 2000` 不足 2 次）强制每 **1 小时** 整点校时快速锁死频偏；连续 2 次验证跑准后自动切换至 `AUTO_TIME_SYNC_INTERVAL_HOURS`（默认 **6 小时**）长间隔省电巡航，一旦后续某次误差超标则自动退回 1 小时模式重新校准；
    - **真实休眠分母**：在 `try_rtc_suspend()` 中累加真实休眠秒数 `ACCUMULATED_SLEPT_SECONDS`，自适应漂移校准直接以实际休眠时间作为分母计算残差 PPM，彻底消除按键亮屏或对时耗时对晶振学习值的干扰；
    - **热路径零 Fork**：将每分钟热路径上的 `$(cat ...)` 与 `$(printf ...)` 全部替换为 POSIX Shell 内置 `read -r` 与参数展开，并将日志大小检查改为整点执行，每天减少约 5.5 万次子进程创建开销。
 
