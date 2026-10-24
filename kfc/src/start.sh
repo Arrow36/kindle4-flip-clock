@@ -486,14 +486,14 @@ update_adaptive_drift_trim() {
   rm -f "$RUNTIME_DIR/accumulated_slept"
 
   is_uint "$ELAPSED_SEC" || return 0
-  [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 28800 ] || return 0
+  [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 86400 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
   [ "${OFFSET_MS#-}" -le 120000 ] || return 0
 
   # When actual RTC suspend duration is tracked, compute residual drift rate
   # against actual sleep seconds rather than total wall-clock elapsed time.
-  if [ "$EFFECTIVE_SLEPT_SEC" -ge 300 ] && [ "$EFFECTIVE_SLEPT_SEC" -le 28800 ]; then
+  if [ "$EFFECTIVE_SLEPT_SEC" -ge 300 ] && [ "$EFFECTIVE_SLEPT_SEC" -le 86400 ]; then
     DRIFT_PPM=$(( (-OFFSET_MS * 1000) / EFFECTIVE_SLEPT_SEC ))
   fi
 
@@ -542,8 +542,14 @@ update_adaptive_drift_trim() {
 
   echo "$ADAPTIVE_PPM_TRIM" > "$RUNTIME_DIR/adaptive_ppm.trim"
   [ -n "$TRIM_PERSIST_FILE" ] && echo "$ADAPTIVE_PPM_TRIM" > "$TRIM_PERSIST_FILE" 2>/dev/null
+  CONVERGED_DURATION_SEC="$EFFECTIVE_SLEPT_SEC"
+  if ! is_uint "$CONVERGED_DURATION_SEC" || [ "$CONVERGED_DURATION_SEC" -lt 3600 ]; then
+    CONVERGED_DURATION_SEC="$ELAPSED_SEC"
+  fi
+  CONVERGED_MAX_OFFSET_MS=$(( (CONVERGED_DURATION_SEC * 350) / 1000 ))
+  [ "$CONVERGED_MAX_OFFSET_MS" -lt 2000 ] && CONVERGED_MAX_OFFSET_MS=2000
   is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
-  if [ "$ABS_DRIFT_PPM" -le 300 ] && [ "${OFFSET_MS#-}" -le 2000 ]; then
+  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "${OFFSET_MS#-}" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
     DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
   else
     DRIFT_CONVERGED_STREAK=0
@@ -1536,17 +1542,25 @@ wait_for_event_or_minute() {
     fi
     IDLE_DEADLINE=$((LAST_INTERACTION_CLOCK + IDLE_SUSPEND_SECONDS))
     WAKE_CLOCK=$((NEXT_DISPLAY_CLOCK - RTC_WAKE_LEAD_SECONDS))
-    LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 1))
+    # Match try_rtc_suspend's >= 5s minimum alarm requirement (WAKE_CLOCK - NOW_CLOCK >= 5).
+    LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 4))
     if [ -z "$SYNC_PID" ] && ! next_render_in_progress && \
        [ "$NOW_CLOCK" -ge "$IDLE_DEADLINE" ] && \
        [ "$NOW_CLOCK" -lt "$LATEST_SUSPEND_CLOCK" ]; then
       if try_rtc_suspend "$WAKE_CLOCK"; then
         RTC_FAILURE_LOGGED=0
         if [ "$RTC_WOKE_EARLY" = "1" ]; then
-          LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
-          log_message "early hardware wake; awake interval restarted for ${IDLE_SUSPEND_SECONDS}s"
           # Give waitforkey time to publish a physical key that caused wake-up.
           pause_briefly
+          if [ -f "$KEY_EVENT_FILE" ]; then
+            LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
+            log_message "early hardware wake; awake interval restarted for ${IDLE_SUSPEND_SECONDS}s"
+          else
+            # Non-key hardware interrupt (e.g. low-battery PMIC threshold):
+            # pause briefly (2s) instead of holding the CPU awake for 15s.
+            LAST_INTERACTION_CLOCK=$((RESUME_SYSTEM - IDLE_SUSPEND_SECONDS + 2))
+            log_message "early hardware wake (non-key); re-suspending after 2s settle"
+          fi
         fi
         continue
       fi
@@ -1642,6 +1656,25 @@ finish_time_sync() {
     fi
   fi
   [ "$SYNC_STATUS" = "success" ]
+}
+
+should_keep_displayed_frame_after_sync() {
+  SYNC_CHECK_NOW="$1"
+  [ "$SYNC_REASON" != "manual" ] || return 1
+  is_uint "$SYNC_CHECK_NOW" && is_uint "$CURRENT_FRAME_EPOCH" || return 1
+  SYNC_CHECK_MIN=$(minute_epoch "$SYNC_CHECK_NOW")
+  if [ "$SYNC_CHECK_MIN" = "$CURRENT_FRAME_EPOCH" ]; then
+    return 0
+  fi
+  # If SNTP stepped the clock backward into the final 45s of the previous
+  # minute right after the top-of-the-hour full refresh (e.g. :00:09 -> :59:41),
+  # keep the already-displayed :00 frame on screen instead of flashing back to
+  # :59 and re-flashing :00 a few seconds later.
+  SYNC_AHEAD_SECONDS=$((CURRENT_FRAME_EPOCH - SYNC_CHECK_NOW))
+  if [ "$SYNC_AHEAD_SECONDS" -ge 1 ] && [ "$SYNC_AHEAD_SECONDS" -le 45 ]; then
+    return 0
+  fi
+  return 1
 }
 
 publish_minute_frame() {
@@ -1804,13 +1837,15 @@ main() {
           update_adaptive_drift_trim
 
           SYSTEM_NOW=$(date +%s)
-          CURRENT_MIN=$(minute_epoch "$SYSTEM_NOW")
-          if [ "$CURRENT_MIN" = "$CURRENT_FRAME_EPOCH" ] && [ "$SYNC_REASON" != "manual" ]; then
-            # Current minute is already on screen and this was an automatic sync or check.
-            # Align virtual schedule without flashing the display
+          if should_keep_displayed_frame_after_sync "$SYSTEM_NOW"; then
+            # Current minute (or upcoming minute within 45s after a backward SNTP step)
+            # is already on screen and this was an automatic sync or check.
+            # Align virtual schedule without flashing the display.
             NEXT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + 60))
             NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
             DRIFT_REMAINDER_MS=0
+            REFRESH_BOUNDARY_UPTIME_CS=""
+            REFRESH_PLANNED_START_UPTIME_CS=""
             log_message "virtual clock aligned: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=system display_clock=$NEXT_DISPLAY_CLOCK"
           else
             cancel_next_frame_render

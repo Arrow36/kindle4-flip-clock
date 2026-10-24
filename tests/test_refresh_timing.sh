@@ -154,7 +154,7 @@ restore_persistent_adaptive_trim
 printf "OFFSET_MS=-90000\nELAPSED_SEC=3600\nDRIFT_PPM=25000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
-printf "OFFSET_MS=-9000\nELAPSED_SEC=30000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
+printf "OFFSET_MS=-9000\nELAPSED_SEC=90000\nDRIFT_PPM=450\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-13400" ]
 
@@ -351,6 +351,31 @@ try_rtc_suspend 3700 2>/dev/null || REJECT_STATUS=$?
 [ "$(cat "$RTC_PATH")" = "0" ]
 [ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
 rmdir "$POWER_STATE_PATH"
+
+# Test 6-hour convergence retention (slept=20745s, offset=-5879ms -> 283ppm <= 350ppm stays converged)
+DRIFT_CONVERGED_STREAK=2
+ACCUMULATED_SLEPT_SECONDS=20745
+printf "OFFSET_MS=-5879\nELAPSED_SEC=21604\nDRIFT_PPM=272\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$DRIFT_CONVERGED_STREAK" = "3" ]
+
+# Test 9-hour calibration acceptance (elapsed=32418s <= 86400s is calibrated rather than dropped)
+ADAPTIVE_PPM_TRIM=0
+ACCUMULATED_SLEPT_SECONDS=31000
+printf "OFFSET_MS=18600\nELAPSED_SEC=32418\nDRIFT_PPM=-600\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-300" ]
+
+# Test should_keep_displayed_frame_after_sync prevents backward :00 -> :59 -> :00 double full refresh
+CURRENT_FRAME_EPOCH=3600
+SYNC_REASON=auto
+should_keep_displayed_frame_after_sync 3609
+should_keep_displayed_frame_after_sync 3581
+should_keep_displayed_frame_after_sync 3555
+if should_keep_displayed_frame_after_sync 3554; then exit 1; fi
+if should_keep_displayed_frame_after_sync 3660; then exit 1; fi
+SYNC_REASON=manual
+if should_keep_displayed_frame_after_sync 3609; then exit 1; fi
 
 rm -rf "$RUNTIME_DIR"
 

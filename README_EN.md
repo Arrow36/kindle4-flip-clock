@@ -2,13 +2,32 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.8** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.5.9** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.5.9 (7.75-day full-cycle telemetry refinements: multi-hour convergence retention, zero backward double-refresh & non-key wake filtering)
+
+Based on a complete 186.1-hour (7 days 18 hours, `100% -> 3%`, 14,581 log lines) single-charge runtime log on v2.5.8:
+
+1. **Multi-Hour Convergence Retention (`CONVERGED_MAX_OFFSET_MS`) & 24-Hour Calibration Window**:
+   - **Rationale**: `update_adaptive_drift_trim()` previously enforced a static `|OFFSET_MS| <= 2000` (2.0s) cap regardless of elapsed sleep time. Once `DRIFT_CONVERGED_STREAK=2` switched auto-sync to `6` hours (`~20,745s` sleep), an accurate residual drift of `283 ppm` (`< 1s/hr`) accumulated `5,879ms > 2,000ms` over 6 hours, falsely resetting `DRIFT_CONVERGED_STREAK=0` back to 1-hour sync.
+   - **Implementation**: Scaled `CONVERGED_MAX_OFFSET_MS` proportionally to sleep duration (`duration * 350 / 1000`, with a `2,000ms` floor for 1-hour intervals), widened the rate bound to `350 ppm` to absorb 1-second integer `date +%s` quantization noise, and extended the valid calibration window from 8 hours (`28,800s`) to 24 hours (`86,400s`).
+
+2. **Eliminated Backward `:00 -> :59 -> :00` Double Full Refresh After Top-of-the-Hour Sync (`should_keep_displayed_frame_after_sync`)**:
+   - **Rationale**: When background SNTP sync completed ~9s after the `:00` full refresh and stepped a fast clock backward by 10–28s into `:59:32 ~ :59:59`, `CURRENT_MIN != CURRENT_FRAME_EPOCH` caused the clock to flash back to `:59` with a full PNG refresh and then perform a second full PNG refresh at `:00` a few seconds later.
+   - **Implementation**: Added `should_keep_displayed_frame_after_sync()` to keep the already-displayed `:00` frame and pre-rendered `:01` partial frame whenever an automatic sync steps the clock into the final 45 seconds before `CURRENT_FRAME_EPOCH`, clearing stale monotonic boundary estimates so `:01` schedules cleanly.
+
+3. **Filtered Non-Key Hardware Wakes from the 15s Interactive Awake Window**:
+   - **Rationale**: At low battery (`< 19%`), PMIC voltage threshold interrupts occasionally woke the kernel 2–3s after suspend without any physical key press, previously triggering the full 15s `IDLE_SUSPEND_SECONDS` interactive window.
+   - **Implementation**: After `pause_briefly` (`100ms`), `wait_for_event_or_minute()` checks `[ -f "$KEY_EVENT_FILE" ]`; genuine key wakes keep the 15s window, while non-key hardware wakes use a brief 2s settle before re-suspending.
+
+4. **Aligned `LATEST_SUSPEND_CLOCK` with Minimum 5s RTC Alarm Guard**:
+   - **Implementation**: Updated `LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 4))` to match `try_rtc_suspend()`'s `>= 5s` minimum alarm check, eliminating spurious `RTC suspend unavailable` warnings and `sleep 1` delays when an early wake at `:57` is set back 1s to `:56`.
 
 ## What changed in 2.5.8 (Duplex reply pipe, FFI microsecond alignment & physical waveform settle guard)
 

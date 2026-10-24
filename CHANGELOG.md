@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## 2.5.9 - 2026-10-25
+
+Based on 186.1-hour (7.75-day, `100% -> 3%`) full-cycle empirical runtime telemetry (`kfc.log`, 14,581 lines).
+
+### Fixed
+
+- **Multi-Hour Convergence Retention (`CONVERGED_MAX_OFFSET_MS`) & 24-Hour Calibration Window**:
+  - Previously, `update_adaptive_drift_trim()` checked a fixed `|OFFSET_MS| <= 2000` (2.0s) threshold regardless of how many hours had elapsed since the previous SNTP sync. Once `DRIFT_CONVERGED_STREAK=2` switched the sync interval from `1h` to `6h` (`~20,745s` of RTC sleep), even an accurate residual drift rate of `283 ppm` (`< 1s/hr`) accumulated `5,879ms > 2,000ms` over 6 hours, falsely resetting `DRIFT_CONVERGED_STREAK=0` and kicking the clock back to hourly Wi-Fi sync.
+  - Scaled `CONVERGED_MAX_OFFSET_MS` proportionally to sleep duration (`350 ppm * duration`, with a `2,000ms` floor for 1-hour intervals) and widened the rate threshold from `300 ppm` to `350 ppm` to absorb 1-second integer `date +%s` quantization noise (`~290 ppm/hr`).
+  - Expanded the valid calibration interval upper bound (`ELAPSED_SEC` and `EFFECTIVE_SLEPT_SEC`) from `28,800s` (8h) to `86,400s` (24h) so valid calibrations are not discarded when one or more 6-hour Wi-Fi sync attempts time out.
+- **Backward Minute Re-Anchor & Double Full PNG Refresh After Top-of-the-Hour Sync (`should_keep_displayed_frame_after_sync`)**:
+  - When the top-of-the-hour `:00` full refresh completed and background SNTP sync finished ~9s later (`:00:09`) with a negative offset (`-10s ~ -28s`), stepping the system clock backward into `:59:32 ~ :59:59` caused `CURRENT_MIN != CURRENT_FRAME_EPOCH`. The clock previously flashed a full PNG redraw back to `:59` and then performed a second full PNG redraw to `:00` a few seconds later (observed 10 times in the 7.75-day log).
+  - Added `should_keep_displayed_frame_after_sync()`: when an automatic sync steps the system clock into the final 45 seconds before the already-displayed `CURRENT_FRAME_EPOCH`, the displayed `:00` frame and pre-rendered `:01` partial digit frame are retained without flashing back to `:59`, and `REFRESH_BOUNDARY_UPTIME_CS` / `REFRESH_PLANNED_START_UPTIME_CS` are cleared so the `:01` boundary recalculates cleanly.
+- **Non-Key Early Hardware Wake 15s Awake Penalty**:
+  - At low battery (`< 19%`), transient PMIC / battery threshold interrupts occasionally woke the kernel 2–3 seconds after entering `mem` suspend without any physical key press (23 occurrences in the final hours). Previously, `RTC_WOKE_EARLY=1` unconditionally restarted the full 15-second `IDLE_SUSPEND_SECONDS` interactive window.
+  - `wait_for_event_or_minute()` now runs `pause_briefly` (`100ms`) first and checks `[ -f "$KEY_EVENT_FILE" ]`: only genuine key wakes restart the 15-second interactive window, whereas non-key hardware wakes apply a brief 2-second settle before re-entering RTC suspend.
+- **Spurious `RTC suspend unavailable` Warnings on Early Wake Setback**:
+  - Aligned `LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 4))` in `wait_for_event_or_minute()` with `try_rtc_suspend()`'s minimum 5-second alarm requirement (`WAKE_CLOCK - NOW_CLOCK >= 5`), eliminating the 6 spurious `RTC suspend unavailable; continuing awake` warnings and `sleep 1` delays when an early wake at `:57` was adjusted back 1 second to `:56`.
+
 ## 2.5.8 - 2026-10-16
 
 ### Added
