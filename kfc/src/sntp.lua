@@ -131,11 +131,15 @@ local function synchronize(server)
 end
 
 local servers = {}
+local pre_jump_s = 0
 for index = 1, #arg do
-    if arg[index] == "--check-only" then
+    local item = arg[index]
+    if item == "--check-only" then
         check_only = true
-    else
-        servers[#servers + 1] = arg[index]
+    elseif item:sub(1, 11) == "--pre-jump=" then
+        pre_jump_s = tonumber(item:sub(12)) or 0
+    elseif item ~= "" then
+        servers[#servers + 1] = item
     end
 end
 if #servers == 0 then
@@ -154,6 +158,7 @@ for _, server in ipairs(servers) do
     sntp_log("SNTP trying " .. server)
     local result, err = synchronize(server)
     if result then
+        local total_offset = result.offset + pre_jump_s
         local extra = ""
         local now_epoch = socket.gettime()
         local elapsed_s = nil
@@ -166,7 +171,7 @@ for _, server in ipairs(servers) do
             last_epoch = tonumber(last_epoch)
             last_offset = tonumber(last_offset)
             if last_epoch and last_offset and (now_epoch - last_epoch) > 5 then
-                delta_s = result.offset - last_offset
+                delta_s = total_offset - last_offset
                 elapsed_s = now_epoch - last_epoch
                 local ppm = (delta_s / elapsed_s) * 1000000
                 extra = string.format(" (delta=%+.4fs in %.0fs, rate=%+.1f ppm)", delta_s, elapsed_s, ppm)
@@ -175,7 +180,7 @@ for _, server in ipairs(servers) do
 
         local write_file = io.open(cache_path, "w")
         if write_file then
-            local stored_offset = check_only and result.offset or 0.0
+            local stored_offset = check_only and total_offset or 0.0
             write_file:write(string.format("%.4f %.6f\n", now_epoch, stored_offset))
             write_file:close()
         end
@@ -184,7 +189,7 @@ for _, server in ipairs(servers) do
             local sync_stat_path = "/tmp/kfc/last_sntp_sync"
             local stat_file = io.open(sync_stat_path, "w")
             if stat_file then
-                local offset_ms = math.floor(result.offset * 1000 + 0.5)
+                local offset_ms = math.floor(total_offset * 1000 + 0.5)
                 local elapsed = math.floor((elapsed_s or 0) + 0.5)
                 local drift_ppm = 0
                 if elapsed > 0 and delta_s then

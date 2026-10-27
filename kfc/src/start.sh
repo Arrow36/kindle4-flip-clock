@@ -21,6 +21,7 @@ SYNC_RESULT_FILE="$RUNTIME_DIR/time_sync.result"
 SYNC_RESULT_TMP="$RUNTIME_DIR/time_sync.result.tmp"
 AUTO_SYNC_RESULT_FILE="$RUNTIME_DIR/auto_sync.result"
 AUTO_SYNC_RESULT_TMP="$RUNTIME_DIR/auto_sync.result.tmp"
+LOG_BUFFER_FILE="$RUNTIME_DIR/kfc.log.buf"
 RENDER_REQUEST_FIFO="$RUNTIME_DIR/render.request"
 RENDER_REPLY_FIFO="$RUNTIME_DIR/render.reply"
 RENDER_SERVER_PID_FILE="$RUNTIME_DIR/render_server.pid"
@@ -49,8 +50,10 @@ PARTIAL_REFRESH_DURATION_MS=800
 FULL_REFRESH_DURATION_MS=1400
 BATTERY_REFRESH_SETTLE_SECONDS=0
 LAST_AUTO_SYNC_EPOCH=0
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=0
 LAST_SYNC_EPOCH=0
 DRIFT_CONVERGED_STREAK=0
+WIFI_FAIL_STREAK=0
 ACCUMULATED_SLEPT_SECONDS=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
@@ -85,6 +88,7 @@ LAST_INTERACTION_CLOCK=0
 RTC_FAILURE_LOGGED=0
 RTC_WOKE_EARLY=0
 RTC_RESUME_LATENESS_SECONDS=0
+EARLY_WAKE_COUNT_IN_MINUTE=0
 REFRESH_SCHEDULE_EPOCH=0
 DRIFT_REMAINDER_MS=0
 REFRESH_BOUNDARY_UPTIME_CS=""
@@ -92,14 +96,32 @@ REFRESH_PLANNED_START_UPTIME_CS=""
 REFRESH_PROFILE_KIND=""
 REFRESH_DURATION_MS=0
 DISPLAY_SETTLE_DEADLINE_CS=""
+LOG_BUFFER_ACTIVE=0
 CLEANED=0
 UI_STOPPED=0
 
 is_uint() {
   case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac
 }
+flush_log_buffer() {
+  if [ -n "${LOG_BUFFER_FILE:-}" ] && [ -s "$LOG_BUFFER_FILE" ]; then
+    cat "$LOG_BUFFER_FILE" >> "$LOG_FILE" 2>/dev/null || true
+    : > "$LOG_BUFFER_FILE" 2>/dev/null || true
+  fi
+}
 log_message() {
-  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+  if [ "${LOG_BUFFER_ACTIVE:-0}" = "1" ] && [ -n "${LOG_BUFFER_FILE:-}" ]; then
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_BUFFER_FILE"
+    if [ -r "$RUNTIME_DIR/battery.volt" ]; then
+      LOG_VOLT=""
+      read -r LOG_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
+      if is_uint "$LOG_VOLT" && [ "$LOG_VOLT" -lt 3600 ]; then
+        flush_log_buffer
+      fi
+    fi
+  else
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+  fi
 }
 log_debug() {
   [ "$DEBUG_LOG" = "1" ] && log_message "debug: $1"
@@ -378,6 +400,8 @@ start_render_server() {
 cleanup() {
   [ "$CLEANED" = "1" ] && return
   CLEANED=1
+  LOG_BUFFER_ACTIVE=0
+  flush_log_buffer
   [ -n "$KEY_PID" ] && kill "$KEY_PID" 2>/dev/null
   cancel_next_frame_render
   stop_render_server
@@ -407,10 +431,26 @@ cleanup() {
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
     "$PID_FILE" "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
-    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
+    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" "$LOG_BUFFER_FILE" \
     "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO" "$CURRENT_FRAME" "$NEXT_FRAME" \
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
+}
+sanitize_runtime_environment() {
+  # Terminate residual Duokan background daemons and stray native framework or
+  # indexer processes that can survive a Duokan "Switch to Kindle" hot-switch
+  # and cause 100% CPU contention or /mnt/us FAT32 I/O stalls.
+  for BG_PROC in KindleApp ebook lcrun UsbSignal.bin BatterySignal.bin \
+                 Charging.bin notCharging.bin PowerState.bin suspending.bin \
+                 mplayer miniftp cvm mesquite webreader phd tmd; do
+    killall -9 "$BG_PROC" >/dev/null 2>&1 || true
+  done
+  killall -9 lipc-wait-event >/dev/null 2>&1 || true
+  CPU_GOV_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+  if [ -w "$CPU_GOV_PATH" ]; then
+    echo ondemand > "$CPU_GOV_PATH" 2>/dev/null || true
+  fi
+  sync >/dev/null 2>&1 || true
 }
 calc_battery_from_voltage() {
   V="$1"
@@ -492,9 +532,15 @@ update_adaptive_drift_trim() {
   [ "${OFFSET_MS#-}" -le 120000 ] || return 0
 
   # When actual RTC suspend duration is tracked, compute residual drift rate
-  # against actual sleep seconds rather than total wall-clock elapsed time.
+  # against actual sleep seconds rather than total wall-clock elapsed time,
+  # and fold in any unapplied sub-second drift remainder (DRIFT_REMAINDER_MS)
+  # so integer-second setback quantization does not add +/-1000ms noise.
+  EFFECTIVE_OFFSET_MS="$OFFSET_MS"
   if [ "$EFFECTIVE_SLEPT_SEC" -ge 300 ] && [ "$EFFECTIVE_SLEPT_SEC" -le 86400 ]; then
-    DRIFT_PPM=$(( (-OFFSET_MS * 1000) / EFFECTIVE_SLEPT_SEC ))
+    is_uint "${DRIFT_REMAINDER_MS#-}" || DRIFT_REMAINDER_MS=0
+    EFFECTIVE_OFFSET_MS=$(( OFFSET_MS + DRIFT_REMAINDER_MS ))
+    DRIFT_REMAINDER_MS=0
+    DRIFT_PPM=$(( (-EFFECTIVE_OFFSET_MS * 1000) / EFFECTIVE_SLEPT_SEC ))
   fi
 
   # DRIFT_PPM is the residual rate observed while the previous effective PPM
@@ -549,7 +595,7 @@ update_adaptive_drift_trim() {
   CONVERGED_MAX_OFFSET_MS=$(( (CONVERGED_DURATION_SEC * 350) / 1000 ))
   [ "$CONVERGED_MAX_OFFSET_MS" -lt 2000 ] && CONVERGED_MAX_OFFSET_MS=2000
   is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
-  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "${OFFSET_MS#-}" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
+  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "${EFFECTIVE_OFFSET_MS#-}" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
     DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
   else
     DRIFT_CONVERGED_STREAK=0
@@ -838,6 +884,7 @@ advance_virtual_clock() {
   CURRENT_FRAME_EPOCH="$NEXT_FRAME_EPOCH"
   NEXT_FRAME_EPOCH=$((NEXT_FRAME_EPOCH + 60))
   NEXT_DISPLAY_CLOCK=$((NEXT_DISPLAY_CLOCK + 60))
+  EARLY_WAKE_COUNT_IN_MINUTE=0
 }
 run_one_shot_renderer() {
   ONE_SHOT_OUTPUT="$1"
@@ -997,7 +1044,6 @@ display_partial_frame() {
   DISPLAY_CHANGED_DIGITS="$PARTIAL_CHANGED_COUNT"
   DISPLAY_START_UPTIME_CS="$PARTIAL_START_CS"
   DISPLAY_END_UPTIME_CS="$PARTIAL_END_CS"
-  DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
   SETTLE_HOLD_CS=$(((PARTIAL_REFRESH_DURATION_MS + 200 + 9) / 10))
   if is_uint "$DISPLAY_START_UPTIME_CS"; then
     DISPLAY_SETTLE_DEADLINE_CS=$((DISPLAY_START_UPTIME_CS + SETTLE_HOLD_CS))
@@ -1018,6 +1064,7 @@ display_partial_frame() {
       log_message "minute: target=$DISPLAY_EPOCH kind=digits region=$PARTIAL_X $PARTIAL_Y $PARTIAL_WIDTH $PARTIAL_HEIGHT DIGITS $DISPLAY_CHANGED_DIGITS refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=unknown refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") duration_ms=$DISPLAY_DURATION_MS fixed_ms=$PARTIAL_REFRESH_DURATION_MS rtc_late=${RTC_RESUME_LATENESS_SECONDS:-unknown}"
     fi
   else
+    DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
     log_message "minute: target=$DISPLAY_EPOCH kind=digits region=$PARTIAL_DETAIL timing=unavailable display_clock=${DISPLAY_END_CLOCK:-unknown} rtc_late=${RTC_RESUME_LATENESS_SECONDS:-unknown}"
   fi
   return 0
@@ -1066,11 +1113,10 @@ render_current_frame() {
 }
 full_refresh() {
   FRAME_PATH="$1"
-  log_message "full refresh: $FRAME_PATH"
   # Match the upstream refresh that is visibly effective on Kindle 4: clear
   # the framebuffer first, then draw the complete PNG.
-  eips -c >> "$LOG_FILE" 2>&1
-  eips -g "$FRAME_PATH" >> "$LOG_FILE" 2>&1
+  eips -c >/dev/null 2>&1
+  eips -g "$FRAME_PATH" >/dev/null 2>&1
 }
 display_frame() {
   FRAME_PATH="$1"
@@ -1078,17 +1124,20 @@ display_frame() {
   DISPLAY_EPOCH="$3"
   DISPLAY_BATTERY="$4"
   DISPLAY_MINUTE=$(((DISPLAY_EPOCH / 60) % 60))
-  DISPLAY_START_CLOCK=$(scheduler_now 2>/dev/null)
-  DISPLAY_START_UPTIME=$(monotonic_stamp)
+  if [ "$FORCE_FULL" = "1" ] || [ "$DISPLAY_MINUTE" -eq 0 ]; then
+    log_message "full refresh: $FRAME_PATH"
+  fi
+  if [ "$DEBUG_LOG" = "1" ]; then
+    DISPLAY_START_CLOCK=$(scheduler_now 2>/dev/null)
+    DISPLAY_START_UPTIME=$(monotonic_stamp)
+    log_debug "display start: target=$DISPLAY_EPOCH battery=$DISPLAY_BATTERY source=$CLOCK_SOURCE clock=${DISPLAY_START_CLOCK:-unknown} uptime=${DISPLAY_START_UPTIME:-unknown}"
+  fi
   DISPLAY_START_UPTIME_CS=$(monotonic_centiseconds 2>/dev/null)
-  log_debug "display start: target=$DISPLAY_EPOCH battery=$DISPLAY_BATTERY source=$CLOCK_SOURCE clock=${DISPLAY_START_CLOCK:-unknown} uptime=${DISPLAY_START_UPTIME:-unknown}"
   if [ "$FORCE_FULL" = "1" ] || [ "$DISPLAY_MINUTE" -eq 0 ]; then
     full_refresh "$FRAME_PATH"
   else
-    eips -g "$FRAME_PATH" >> "$LOG_FILE" 2>&1
+    eips -g "$FRAME_PATH" >/dev/null 2>&1
   fi
-  DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
-  DISPLAY_END_UPTIME=$(monotonic_stamp)
   DISPLAY_END_UPTIME_CS=$(monotonic_centiseconds 2>/dev/null)
   if [ "$FORCE_FULL" = "1" ] || [ "$DISPLAY_MINUTE" -eq 0 ]; then
     SETTLE_HOLD_CS=$(((FULL_REFRESH_DURATION_MS + 200 + 9) / 10))
@@ -1111,6 +1160,8 @@ display_frame() {
       log_message "frame: target=$DISPLAY_EPOCH kind=png battery=$DISPLAY_BATTERY refresh_start=$(format_monotonic_centiseconds "$DISPLAY_START_UPTIME_CS") minute_boundary=none refresh_end=$(format_monotonic_centiseconds "$DISPLAY_END_UPTIME_CS") duration_ms=$DISPLAY_DURATION_MS fixed_ms=$FULL_REFRESH_DURATION_MS"
     fi
   else
+    DISPLAY_END_CLOCK=$(scheduler_now 2>/dev/null)
+    DISPLAY_END_UPTIME=$(monotonic_stamp)
     log_message "frame: target=$DISPLAY_EPOCH kind=png battery=$DISPLAY_BATTERY clock=${DISPLAY_END_CLOCK:-unknown} uptime=${DISPLAY_END_UPTIME:-unknown} timing=unavailable"
   fi
 }
@@ -1317,18 +1368,34 @@ refresh_battery_sample_after_hourly_full_refresh() {
       INTERVAL_DUE=0
       EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
       is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
+      is_uint "$WIFI_FAIL_STREAK" || WIFI_FAIL_STREAK=0
+      is_uint "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" || LAST_AUTO_SYNC_ATTEMPT_EPOCH=0
+      SYNC_REF_EPOCH="$LAST_AUTO_SYNC_EPOCH"
       if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -lt 2 ]; then
         EFFECTIVE_SYNC_INTERVAL_HOURS=1
+      elif [ "$WIFI_FAIL_STREAK" -gt 0 ] && [ "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" -gt "$LAST_AUTO_SYNC_EPOCH" ]; then
+        # Already proven accurate (streak >= 2), but the scheduled Wi-Fi sync timed out.
+        # Back off progressively (1h -> 3h -> full interval) from the last attempt.
+        SYNC_REF_EPOCH="$LAST_AUTO_SYNC_ATTEMPT_EPOCH"
+        if [ "$WIFI_FAIL_STREAK" -eq 1 ]; then
+          EFFECTIVE_SYNC_INTERVAL_HOURS=1
+        elif [ "$WIFI_FAIL_STREAK" -eq 2 ]; then
+          EFFECTIVE_SYNC_INTERVAL_HOURS=3
+          [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt "$AUTO_TIME_SYNC_INTERVAL_HOURS" ] && \
+            EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
+        else
+          EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
+        fi
       fi
-      if [ "$LAST_AUTO_SYNC_EPOCH" -le 0 ] || [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -le 1 ]; then
+      if [ "$SYNC_REF_EPOCH" -le 0 ] || [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -le 1 ]; then
         # First top-of-the-hour after startup, or unconverged/1h sync interval: always due at :00
         INTERVAL_DUE=1
-      elif [ "$AUTO_SYNC_NOW" -lt "$LAST_AUTO_SYNC_EPOCH" ]; then
+      elif [ "$AUTO_SYNC_NOW" -lt "$SYNC_REF_EPOCH" ]; then
         INTERVAL_DUE=1
       else
         AUTO_SYNC_THRESHOLD_SECONDS=$(( EFFECTIVE_SYNC_INTERVAL_HOURS * 3600 - 300 ))
         [ "$AUTO_SYNC_THRESHOLD_SECONDS" -lt 1800 ] && AUTO_SYNC_THRESHOLD_SECONDS=1800
-        if [ $((AUTO_SYNC_NOW - LAST_AUTO_SYNC_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
+        if [ $((AUTO_SYNC_NOW - SYNC_REF_EPOCH)) -ge "$AUTO_SYNC_THRESHOLD_SECONDS" ]; then
           INTERVAL_DUE=1
         fi
       fi
@@ -1336,8 +1403,12 @@ refresh_battery_sample_after_hourly_full_refresh() {
         CURRENT_SYNC_VOLT=""
         [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_SYNC_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
         is_uint "$CURRENT_SYNC_VOLT" || CURRENT_SYNC_VOLT=$(get_battery_voltage)
-        if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt 3550 ]; then
-          log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < 3550mV)"
+        LOW_BATT_SYNC_LIMIT=3550
+        if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -ge 2 ]; then
+          LOW_BATT_SYNC_LIMIT=3600
+        fi
+        if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt "$LOW_BATT_SYNC_LIMIT" ]; then
+          log_message "auto sync skipped: low battery (${CURRENT_SYNC_VOLT}mV < ${LOW_BATT_SYNC_LIMIT}mV)"
         else
           AUTO_SYNC_DUE=1
         fi
@@ -1533,8 +1604,8 @@ wait_for_event_or_minute() {
         finish_next_frame_render || true
       fi
       prepare_refresh_release "$NOW_CLOCK" || true
-      REFRESH_ACTUAL_CLOCK=$(scheduler_now 2>/dev/null)
       if [ "$DEBUG_LOG" = "1" ]; then
+        REFRESH_ACTUAL_CLOCK=$(scheduler_now 2>/dev/null)
         log_debug "refresh release: target=$NEXT_FRAME_EPOCH display_clock=$NEXT_DISPLAY_CLOCK profile=$REFRESH_PROFILE_KIND estimate_ms=$REFRESH_DURATION_MS actual_clock=${REFRESH_ACTUAL_CLOCK:-unknown} uptime=$(monotonic_stamp)"
       fi
       WAIT_REASON="minute"
@@ -1553,13 +1624,24 @@ wait_for_event_or_minute() {
           # Give waitforkey time to publish a physical key that caused wake-up.
           pause_briefly
           if [ -f "$KEY_EVENT_FILE" ]; then
+            EARLY_WAKE_COUNT_IN_MINUTE=0
             LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
             log_message "early hardware wake; awake interval restarted for ${IDLE_SUSPEND_SECONDS}s"
           else
-            # Non-key hardware interrupt (e.g. low-battery PMIC threshold):
-            # pause briefly (2s) instead of holding the CPU awake for 15s.
-            LAST_INTERACTION_CLOCK=$((RESUME_SYSTEM - IDLE_SUSPEND_SECONDS + 2))
-            log_message "early hardware wake (non-key); re-suspending after 2s settle"
+            is_uint "$EARLY_WAKE_COUNT_IN_MINUTE" || EARLY_WAKE_COUNT_IN_MINUTE=0
+            EARLY_WAKE_COUNT_IN_MINUTE=$((EARLY_WAKE_COUNT_IN_MINUTE + 1))
+            if [ "$EARLY_WAKE_COUNT_IN_MINUTE" -le 1 ]; then
+              # Non-key hardware interrupt (e.g. single PMIC threshold):
+              # pause briefly (2s) instead of holding the CPU awake for 15s.
+              LAST_INTERACTION_CLOCK=$((RESUME_SYSTEM - IDLE_SUSPEND_SECONDS + 2))
+              log_message "early hardware wake (non-key); re-suspending after 2s settle"
+            else
+              # Repeated non-key interrupt in the same minute (e.g. persistent
+              # low-battery PMIC alarm): hold awake for IDLE_SUSPEND_SECONDS to
+              # prevent rapid suspend/resume thrashing.
+              LAST_INTERACTION_CLOCK="$RESUME_SYSTEM"
+              log_message "repeated early hardware wake (non-key #${EARLY_WAKE_COUNT_IN_MINUTE}); holding awake for ${IDLE_SUSPEND_SECONDS}s"
+            fi
           fi
         fi
         continue
@@ -1623,8 +1705,11 @@ start_time_sync() {
   SYNC_REASON="${1:-manual}"
   [ -n "$SYNC_PID" ] && return 1
   rm -f "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$SYNC_PID_FILE"
+  flush_log_buffer
   log_message "$SYNC_REASON time synchronization requested"
+  flush_log_buffer
   (
+    LOG_BUFFER_ACTIVE=0
     trap 'wifi_set_enabled 0; exit 143' 1 2 15
     if time_sync_now "$SYNC_REASON"; then
       echo success > "$SYNC_RESULT_TMP"
@@ -1745,7 +1830,7 @@ main() {
     "$NEXT_FRAME_META" \
     "$KEY_PID_FILE" "$NEXT_RENDER_PID_FILE" "$SYNC_PID_FILE" \
     "$SYNC_RESULT_FILE" "$SYNC_RESULT_TMP" "$RENDER_SERVER_PID_FILE" \
-    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" \
+    "$AUTO_SYNC_RESULT_FILE" "$AUTO_SYNC_RESULT_TMP" "$LOG_BUFFER_FILE" \
     "$RENDER_REQUEST_FIFO" "$RENDER_REPLY_FIFO" "$PARTIAL_DISABLED_FILE" \
     "$RUNTIME_DIR/accumulated_slept" "$RUNTIME_DIR"/render-status-*
   load_settings
@@ -1761,11 +1846,15 @@ main() {
     log_message "startup time synchronization succeeded"
     LAST_SYNC_EPOCH=$(date +%s)
     LAST_AUTO_SYNC_EPOCH=0
+    LAST_AUTO_SYNC_ATTEMPT_EPOCH=0
+    WIFI_FAIL_STREAK=0
     update_adaptive_drift_trim
   else
     log_message "startup time synchronization failed; continuing with system time"
     LAST_SYNC_EPOCH=0
     LAST_AUTO_SYNC_EPOCH=0
+    LAST_AUTO_SYNC_ATTEMPT_EPOCH=0
+    WIFI_FAIL_STREAK=0
   fi
   # time_sync_now normally turns Wi-Fi off itself. Enforce the requested
   # post-sync state on every success and failure path.
@@ -1785,6 +1874,7 @@ main() {
   fi
   log_message "startup battery: level=${CURRENT_FRAME_BATTERY}%$STARTUP_VOLT_MSG"
   /etc/init.d/framework stop >/dev/null 2>&1
+  sanitize_runtime_environment
   UI_STOPPED=1
   /usr/bin/lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1
   watch_keys &
@@ -1798,18 +1888,22 @@ main() {
     NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
   fi
   prepare_next_minute
+  flush_log_buffer
+  LOG_BUFFER_ACTIVE=1
 
   while [ ! -f "$EXIT_FILE" ]; do
     wait_for_event_or_minute "$NEXT_FRAME_EPOCH"
     [ -f "$EXIT_FILE" ] && break
     case "$WAIT_REASON" in
       key)
+        EARLY_WAKE_COUNT_IN_MINUTE=0
         log_message "key event: $KEY_ACTION"
         LAST_INTERACTION_CLOCK=$(scheduler_now 2>/dev/null)
         is_uint "$LAST_INTERACTION_CLOCK" || LAST_INTERACTION_CLOCK=$(date +%s)
         handle_key_action "$KEY_ACTION"
         KEY_STATUS=$?
         if [ "$KEY_STATUS" -eq 2 ]; then
+          WIFI_FAIL_STREAK=0
           cancel_next_frame_render
           start_time_sync
         elif [ "$KEY_STATUS" -eq 3 ]; then
@@ -1825,6 +1919,7 @@ main() {
           fi
           prepare_next_minute
         fi
+        flush_log_buffer
         ;;
       render)
         finish_next_frame_render
@@ -1833,7 +1928,11 @@ main() {
         if finish_time_sync; then
           log_message "$SYNC_REASON time synchronization succeeded"
           LAST_SYNC_EPOCH=$(date +%s)
-          [ "$SYNC_REASON" = "auto" ] && LAST_AUTO_SYNC_EPOCH="$LAST_SYNC_EPOCH"
+          if [ "$SYNC_REASON" = "auto" ]; then
+            LAST_AUTO_SYNC_EPOCH="$LAST_SYNC_EPOCH"
+            LAST_AUTO_SYNC_ATTEMPT_EPOCH="$LAST_SYNC_EPOCH"
+          fi
+          WIFI_FAIL_STREAK=0
           update_adaptive_drift_trim
 
           SYSTEM_NOW=$(date +%s)
@@ -1859,21 +1958,31 @@ main() {
           fi
         else
           log_message "$SYNC_REASON time synchronization failed"
-          if [ "$SYNC_REASON" = "manual" ]; then
+          if [ "$SYNC_REASON" = "auto" ]; then
+            LAST_AUTO_SYNC_ATTEMPT_EPOCH=$(date +%s)
+            is_uint "$WIFI_FAIL_STREAK" || WIFI_FAIL_STREAK=0
+            WIFI_FAIL_STREAK=$((WIFI_FAIL_STREAK + 1))
+          elif [ "$SYNC_REASON" = "manual" ]; then
             prepare_next_minute
           fi
         fi
+        flush_log_buffer
         ;;
       minute)
         publish_minute_frame
         advance_virtual_clock
         if [ $(((CURRENT_FRAME_EPOCH / 60) % 60)) -eq 0 ]; then
+          flush_log_buffer
           if truncate_log_if_oversize "$LOG_FILE" "$LOG_MAX_BYTES"; then
             log_message "log truncated at ${LOG_MAX_BYTES} bytes"
+            flush_log_buffer
           fi
         fi
         prepare_next_minute
         refresh_battery_sample_after_hourly_full_refresh || true
+        if [ $(((CURRENT_FRAME_EPOCH / 60) % 60)) -eq 0 ]; then
+          flush_log_buffer
+        fi
         ;;
     esac
   done

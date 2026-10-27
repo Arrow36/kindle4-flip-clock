@@ -62,11 +62,12 @@ wait_for_wifi() {
 
 run_koreader_sntp() {
   EXTRA_OPTION="$1"
+  PRE_JUMP_OPTION="${2:-}"
   if [ -x /mnt/us/koreader/luajit ] && [ -f "$SRC_DIR/sntp.lua" ]; then
     time_sync_log "using KOReader LuaSocket SNTP client"
     # Intentional word splitting: the Lua client tries each peer in order.
     # shellcheck disable=SC2086
-    (cd /mnt/us/koreader && ./luajit "$SRC_DIR/sntp.lua" $EXTRA_OPTION $NTP_SERVERS) >> "$LOG_FILE" 2>&1
+    (cd /mnt/us/koreader && ./luajit "$SRC_DIR/sntp.lua" $EXTRA_OPTION $PRE_JUMP_OPTION $NTP_SERVERS) >> "$LOG_FILE" 2>&1
     return $?
   fi
 
@@ -83,6 +84,7 @@ time_sync_now() {
 
   SYNC_START_TIME=$(time_sync_monotonic_seconds 2>/dev/null)
   case "$SYNC_START_TIME" in ''|*[!0-9]*) SYNC_START_TIME=0 ;; esac
+  PRE_WIFI_EPOCH=$(date +%s 2>/dev/null)
   time_sync_log "enabling Wi-Fi for time synchronization"
   if ! wifi_set_enabled 1; then
     time_sync_log "failed to enable Wi-Fi"
@@ -99,6 +101,20 @@ time_sync_now() {
   WIFI_CONNECT_SEC=$(time_sync_elapsed_seconds "$SYNC_START_TIME" "$WIFI_READY_TIME")
   time_sync_log "Wi-Fi connected in ${WIFI_CONNECT_SEC}s"
 
+  POST_WIFI_EPOCH=$(date +%s 2>/dev/null)
+  PRE_JUMP_ARG=""
+  case "$PRE_WIFI_EPOCH:$POST_WIFI_EPOCH:$WIFI_CONNECT_SEC" in
+    ''|*[!0-9:]*) ;;
+    *)
+      EXPECTED_POST_WIFI_EPOCH=$((PRE_WIFI_EPOCH + WIFI_CONNECT_SEC))
+      WIFI_CLOCK_JUMP_SEC=$((POST_WIFI_EPOCH - EXPECTED_POST_WIFI_EPOCH))
+      if [ "$WIFI_CLOCK_JUMP_SEC" -ge 2 ] || [ "$WIFI_CLOCK_JUMP_SEC" -le -2 ]; then
+        time_sync_log "detected system clock jump during Wi-Fi connect: ${WIFI_CLOCK_JUMP_SEC}s"
+        PRE_JUMP_ARG="--pre-jump=$WIFI_CLOCK_JUMP_SEC"
+      fi
+      ;;
+  esac
+
   if [ "$SYNC_MODE" = "auto" ]; then
     CURRENT_SEC=$(( $(date +%s) % 60 ))
     if [ "$CURRENT_SEC" -ge 40 ]; then
@@ -110,7 +126,7 @@ time_sync_now() {
 
   if [ "$SYNC_MODE" = "check_only" ]; then
     time_sync_log "checking NTP offset (passive monitor) with: $NTP_SERVERS"
-    run_koreader_sntp "--check-only"
+    run_koreader_sntp "--check-only" "$PRE_JUMP_ARG"
     TIME_SYNC_STATUS=$?
     SYNC_END_TIME=$(time_sync_monotonic_seconds 2>/dev/null)
     case "$SYNC_END_TIME" in ''|*[!0-9]*) SYNC_END_TIME="$WIFI_READY_TIME" ;; esac
@@ -125,7 +141,7 @@ time_sync_now() {
   fi
 
   time_sync_log "synchronizing with: $NTP_SERVERS"
-  run_koreader_sntp ""
+  run_koreader_sntp "" "$PRE_JUMP_ARG"
   TIME_SYNC_STATUS=$?
   if [ "$TIME_SYNC_STATUS" -ne 0 ]; then
     SYNC_END_TIME=$(time_sync_monotonic_seconds 2>/dev/null)

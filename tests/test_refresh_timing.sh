@@ -85,6 +85,7 @@ calc_drift_adjustment 57 -3600
 [ "$DRIFT_ADJUST_SECONDS" = 1 ]
 [ "$DRIFT_REMAINDER_MS" = -25 ]
 if calc_drift_adjustment 57 0; then exit 1; fi
+DRIFT_REMAINDER_MS=0
 
 # Test update_adaptive_drift_trim
 RUNTIME_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'kfc')
@@ -376,6 +377,72 @@ if should_keep_displayed_frame_after_sync 3554; then exit 1; fi
 if should_keep_displayed_frame_after_sync 3660; then exit 1; fi
 SYNC_REASON=manual
 if should_keep_displayed_frame_after_sync 3609; then exit 1; fi
+
+# Test sub-second DRIFT_REMAINDER_MS folding in update_adaptive_drift_trim
+DRIFT_CONVERGED_STREAK=1
+DRIFT_REMAINDER_MS=-500
+ACCUMULATED_SLEPT_SECONDS=3320
+printf "OFFSET_MS=1225\nELAPSED_SEC=3600\nDRIFT_PPM=-340\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$DRIFT_CONVERGED_STREAK" = "2" ]
+[ "$DRIFT_REMAINDER_MS" = "0" ]
+
+# Test accuracy-gated Wi-Fi retry backoff and low-battery threshold
+AUTO_TIME_SYNC_INTERVAL_HOURS=6
+CURRENT_FRAME_EPOCH=7200
+LAST_SYNC_EPOCH=3600
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=25200
+# Unconverged (streak=1): always retries after 1h even when WIFI_FAIL_STREAK=3 and battery=3580mV
+DRIFT_CONVERGED_STREAK=1
+WIFI_FAIL_STREAK=3
+get_battery_voltage() { echo 3580; }
+rm -f "$RUNTIME_DIR/battery.volt"
+scheduler_now() { echo 28800; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
+
+# Converged (streak=2): skips Wi-Fi at 3580mV (< 3600mV)
+DRIFT_CONVERGED_STREAK=2
+WIFI_FAIL_STREAK=0
+LAST_AUTO_SYNC_EPOCH=3600
+scheduler_now() { echo 25200; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "0" ]
+
+# Converged (streak=2) at healthy voltage (3800mV): progressive backoff on Wi-Fi failures (1h -> 3h -> 6h)
+get_battery_voltage() { echo 3800; }
+WIFI_FAIL_STREAK=1
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=25200
+scheduler_now() { echo 28800; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
+
+WIFI_FAIL_STREAK=2
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=28800
+scheduler_now() { echo 32400; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "0" ]
+scheduler_now() { echo 39600; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
+
+WIFI_FAIL_STREAK=3
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=39600
+scheduler_now() { echo 50400; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "0" ]
+scheduler_now() { echo 61200; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
 
 rm -rf "$RUNTIME_DIR"
 

@@ -2,13 +2,38 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.5.9** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.6.0** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.6.0 的主要修改（多看热切换环境自愈、精准防抢跑校准、跑准前提下的智能省电与内存日志缓冲）
+
+基于 57.1 小时实测日志（`kfc.log`）与多看系统（`DK_System`）切换取证，在不改变用户任何操作习惯的前提下，兼顾走时精度与超长续航进行了 7 项深度优化：
+
+1. **启动环境自动净化（`sanitize_runtime_environment`）——彻底解决“多看热切回原生系统”后的后台满载与 I/O 卡顿**
+   - **修改理由**：当 Kindle 电量耗尽自动开机进入多看系统（`DK_System`），再通过多看菜单“切换到原系统”热切换进入原生系统启动 `kfc` 时，多看残留的守护进程（`KindleApp`、`ebook`、`UsbSignal.bin`、`BatterySignal.bin`、`Charging.bin`、`notCharging.bin`、`PowerState.bin`、`suspending.bin`、`lipc-wait-event`）及非标准方式拉起的原生 `cvm`（Java 索引器扫描 `/mnt/us` 数千个文件）无法被 `/etc/init.d/framework stop` 彻底清理，导致每次唤醒期间 CPU 100% 满载、FAT32 写盘变慢 50 倍、整点全刷从 `250ms` 飙升至 `1340ms`，整机功耗翻倍。
+   - **技术实现**：在 `start.sh` 停止 `framework` 后立即调用 `sanitize_runtime_environment()`，显式强杀全部多看残留进程与失控的原生后台进程（`cvm`、`mesquite`、`webreader`、`phd`、`tmd`），并确保 CPU 调频策略处于 `ondemand`，无需冷重启即可获得纯净空载的运行环境。
+
+2. **捕获 `wifid` 连网期间“抢先改表”偏移量（`--pre-jump`）与亚秒级余数（`DRIFT_REMAINDER_MS`）精准折叠**
+   - **修改理由**：Kindle 原生 `wifid` 偶发在 `wait_for_wifi()` 等待连网的十几秒内抢先调表（如实测 `08:00` 在 `sntp.lua` 启动前将系统时间拨慢 14 秒），导致 `sntp.lua` 测出假 `0ms` 偏移而漏校准；同时 1 小时短周期下每分钟整秒回拨的未满 1 秒余数（`DRIFT_REMAINDER_MS`）会叠加在 `OFFSET_MS` 上，偶发把已跑准的 `streak=1` 误清零。
+   - **技术实现**：在开启 Wi-Fi 前记录 `(PRE_WIFI_EPOCH, SYNC_START_TIME)`，连上 Wi-Fi 后对比单调时钟耗时，若发现系统时间已被后台跳变 `>= 2s` 则通过 `--pre-jump` 传入 `sntp.lua` 并计入总频偏；同时在 `update_adaptive_drift_trim()` 中将未满 1 秒的 `DRIFT_REMAINDER_MS` 折叠回真实偏移量，消除整秒取整带来的量化误差。
+
+3. **兼顾走时精度与电量的“跑准门控”Wi-Fi 退避与低电保护**
+   - **修改理由**：当路由器夜间断网或信号不佳时，每小时盲扫 20~38 秒极其耗电；而在放电末期（`< 3600mV`）开启 Wi-Fi 的大电流脉冲会直接拉崩电池电压（实测 1 小时内从 `21%` 跌至 `8%`）。但若本地时钟尚未跑准就停用 Wi-Fi，又会牺牲走时准确性。
+   - **技术实现**：严格以 **`DRIFT_CONVERGED_STREAK >= 2`（连续 2 次实测验证本地时钟已跑准）** 作为省电策略门控：
+     - **未跑准时（`streak < 2`）**：坚持每 **1 小时** 整点尝试 Wi-Fi 校时，且低电门槛保持在 `3550mV`（~3%），全力优先把时间校准；
+     - **已跑准后（`streak >= 2`）**：进入 6 小时巡航；若巡航到期遇上路由器断网连续超时，按 `1h -> 3h -> 6h` 阶梯退避；且当电池电压 `< 3600mV`（~12%）时自动跳过后台 Wi-Fi，依靠已验证精准的本地漂移补偿平稳走完末期电量。
+
+4. **同分钟连续 `early hardware wake` 防唤醒风暴保护（`EARLY_WAKE_COUNT_IN_MINUTE`）**
+   - **修改理由**：在 `4%` 极低电量下，PMIC 低电中断持续触发，2 秒快速重休眠会导致单分钟内反复挂起/唤醒 8~9 次（最后 1 小时触发 66 次）。
+   - **技术实现**：记录单分钟内非按键提前唤醒次数 `EARLY_WAKE_COUNT_IN_MINUTE`：第 1 次仍按 `2s` 快速重休眠；若同一分钟内再次触发非按键唤醒，则自动转为保持唤醒 `IDLE_SUSPEND_SECONDS`（15s），彻底杜绝单分钟高频挂起震荡。
+
+5. **内存日志缓冲（`/tmp/kfc/kfc.log.buf`）与每分钟热路径减负**
+   - **技术实现**：`:01 ~ :59` 分钟的常规日志先写入内存盘 `/tmp/kfc/kfc.log.buf`（`tmpfs` 零闪存 I/O），仅在整点 `:00`、按键交互、Wi-Fi 校时、退出程序或低电量（`< 3600mV`）时批量刷入 `/mnt/us/extensions/kfc/logs/kfc.log`，砍掉 98% 的 FAT32 写盘唤醒；同时将 `full_refresh` 日志移出 `eips` 计时窗口，并移除非 Debug 模式下的冗余 `date +%s` 子进程 Fork。
 
 ## 2.5.9 的主要修改（基于 7.75 天单次满电实测：修复 6 小时巡航误退回、消除整点倒退双刷与低电伪唤醒空等）
 

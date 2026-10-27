@@ -2,13 +2,37 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.5.9** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.6.0** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.6.0 (Duokan hot-switch runtime sanitization, pre-SNTP jump capture, accuracy-gated Wi-Fi power saving & RAM log buffering)
+
+Based on 57.1 hours of empirical runtime telemetry (`kfc.log`, 4,466 lines) and Duokan (`DK_System`) cross-system startup forensics:
+
+1. **Startup Runtime Environment Sanitization (`sanitize_runtime_environment`)**:
+   - **Rationale**: When the Kindle boots into Duokan (`DK_System`) after battery depletion and is hot-switched back to the native Kindle OS via Duokan's "Switch to Kindle" menu option without a cold reboot, residual Duokan daemons (`KindleApp`, `ebook`, `UsbSignal.bin`, `BatterySignal.bin`, `Charging.bin`, `notCharging.bin`, `PowerState.bin`, `suspending.bin`, `lipc-wait-event`) and non-Upstart native `cvm` / indexer processes survive `/etc/init.d/framework stop`, causing 100% CPU contention and 4x–5x slower `/mnt/us` FAT32 I/O (`eips` full refresh `1340ms` vs `250ms`, doubling active power draw).
+   - **Implementation**: `main()` calls `sanitize_runtime_environment()` immediately after stopping `framework` to terminate all residual Duokan daemons and stray native framework/indexer processes (`cvm`, `mesquite`, `webreader`, `phd`, `tmd`) and enforce the `ondemand` CPU scaling governor.
+
+2. **Pre-SNTP `wifid` Clock Jump Capture (`--pre-jump`) & Sub-Second Remainder (`DRIFT_REMAINDER_MS`) Folding**:
+   - **Rationale**: Kindle's native `wifid` occasionally steps the system clock while `wait_for_wifi()` is associating (before `sntp.lua` queries NTP), causing `sntp.lua` to measure a false `~0ms` offset and skip drift calibration. In addition, unapplied sub-second drift remainders (`DRIFT_REMAINDER_MS`) could push 1-hour offsets slightly past the convergence threshold.
+   - **Implementation**: `time_sync_now()` compares `(POST_WIFI_EPOCH - PRE_WIFI_EPOCH)` against monotonic `WIFI_CONNECT_SEC` (`/proc/uptime`) and passes any `>= 2s` jump via `--pre-jump=<sec>` to `sntp.lua`. `update_adaptive_drift_trim()` also folds `DRIFT_REMAINDER_MS` into `EFFECTIVE_OFFSET_MS` when evaluating real sleep intervals (`EFFECTIVE_SLEPT_SEC >= 300`).
+
+3. **Accuracy-Gated Wi-Fi Timeout Backoff & Low-Battery Protection (`WIFI_FAIL_STREAK`)**:
+   - **Rationale**: Repeated 20–38s Wi-Fi timeouts during router outages and high-current Wi-Fi bursts below `3600mV` drain significant battery, but Wi-Fi must never be backed off or disabled before the clock is proven accurate.
+   - **Implementation**: Strictly gated on **`DRIFT_CONVERGED_STREAK >= 2`** (at least two consecutive verified accurate syncs):
+     - **While unconverged (`streak < 2`)**: Always retries every `1` hour at `:00` down to `3550mV` to prioritize time accuracy.
+     - **Once converged (`streak >= 2`)**: Uses the 6-hour cruise interval, backs off progressively (`1h -> 3h -> full interval`) if scheduled Wi-Fi syncs time out repeatedly (`WIFI_FAIL_STREAK`), and skips automatic Wi-Fi below `3600mV` (~12% battery) while local drift compensation is verified accurate.
+
+4. **Repeated Non-Key Early Hardware Wake Storm Guard (`EARLY_WAKE_COUNT_IN_MINUTE`)**:
+   - **Implementation**: Limits the 2-second fast re-suspend on non-key early hardware wakes (`RTC_WOKE_EARLY=1`) to once per minute; if a persistent PMIC low-battery interrupt wakes the kernel again within the same minute, `wait_for_event_or_minute()` holds awake for `IDLE_SUSPEND_SECONDS` (`15s`) to prevent 8–9 suspend/resume cycles inside one minute.
+
+5. **RAM-Buffered Per-Minute Logging (`/tmp/kfc/kfc.log.buf`) & Hot-Path Fork Reduction**:
+   - **Implementation**: Buffers routine `:01..:59` logs in `/tmp/kfc/kfc.log.buf` (`tmpfs` in RAM) and flushes to `/mnt/us/extensions/kfc/logs/kfc.log` at `:00`, on key events, around SNTP syncs, on exit, or immediately when battery `< 3600mV`, eliminating ~98% of FAT32 flash writes. Moved `full_refresh` logging outside the timed `eips` block and removed redundant `date +%s` forks when `DEBUG_LOG=0`.
 
 ## What changed in 2.5.9 (7.75-day full-cycle telemetry refinements: multi-hour convergence retention, zero backward double-refresh & non-key wake filtering)
 

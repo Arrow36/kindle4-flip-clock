@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.0 - 2026-10-27
+
+Based on 57.1-hour empirical runtime telemetry (`kfc.log`, 4,466 lines) and Duokan (`DK_System/xKindle`) cross-system startup forensics.
+
+### Added
+
+- **Runtime Environment Sanitization on Startup (`sanitize_runtime_environment`)**:
+  - When the Kindle boots into Duokan (`DK_System`) and is switched to the native Kindle OS via Duokan's "Switch to Kindle" hot-switch (without a cold reboot), residual Duokan helper daemons (`KindleApp`, `ebook`, `lcrun`, `UsbSignal.bin`, `BatterySignal.bin`, `Charging.bin`, `notCharging.bin`, `PowerState.bin`, `suspending.bin`, `mplayer`, `miniftp`, `lipc-wait-event`) and non-Upstart native `cvm` / indexer processes survive `/etc/init.d/framework stop`, causing 100% CPU contention and 4x–5x slower `/mnt/us` FAT32 I/O across the entire session.
+  - `main()` now calls `sanitize_runtime_environment()` immediately after stopping `framework` to explicitly terminate all residual Duokan daemons and stray native framework/indexer processes (`cvm`, `mesquite`, `webreader`, `phd`, `tmd`) and enforce the `ondemand` CPU frequency governor.
+- **Pre-SNTP `wifid` Clock Jump Detection (`--pre-jump` in `time_sync.sh` & `sntp.lua`)**:
+  - Occasionally, Kindle's native `wifid` / network daemon steps the system clock while `wait_for_wifi()` is waiting for association, before `sntp.lua` sends its UDP query (e.g., stepping the clock back by 14s during a 12s Wi-Fi connect). Previously, `sntp.lua` then measured `offset = ~0ms (0 ppm)`, causing `update_adaptive_drift_trim()` to miss the true crystal drift.
+  - `time_sync_now()` now compares `(POST_WIFI_EPOCH - PRE_WIFI_EPOCH)` against monotonic `WIFI_CONNECT_SEC` (`/proc/uptime`). Any clock jump `>= 2s` during Wi-Fi connection is passed via `--pre-jump=<sec>` to `sntp.lua` and folded into `OFFSET_MS` for accurate closed-loop drift calibration.
+- **Accuracy-Gated Wi-Fi Timeout Backoff & Low-Battery Protection (`WIFI_FAIL_STREAK`)**:
+  - Balances time accuracy and battery life: while `DRIFT_CONVERGED_STREAK < 2` (clock not yet proven accurate), auto-sync always retries every `1` hour at `:00` down to `3550mV` so the clock calibrates as quickly as possible.
+  - Once `DRIFT_CONVERGED_STREAK >= 2` (local drift compensation proven accurate over 2+ consecutive syncs):
+    - If scheduled Wi-Fi syncs time out repeatedly (e.g., router powered off overnight), retries back off progressively (`1h -> 3h -> full interval`) via `WIFI_FAIL_STREAK` instead of scanning Wi-Fi for 20–38s every single hour.
+    - Automatic Wi-Fi sync is skipped below `3600mV` (~12% battery, up from `3550mV`) so high-current Wi-Fi bursts do not collapse late-discharge battery voltage while local RTC drift compensation is already running accurately.
+- **RAM-Buffered Per-Minute Logging (`/tmp/kfc/kfc.log.buf`)**:
+  - Routine per-minute (`:01..:59`) and drift-adjustment logs are buffered in `/tmp/kfc/kfc.log.buf` (`tmpfs` in RAM) and flushed in a single batch to `/mnt/us/extensions/kfc/logs/kfc.log` at the top of each hour (`:00`), on key events, around SNTP syncs, on exit, or immediately whenever battery voltage is `< 3600mV`, eliminating ~98% of eMMC/FAT32 flash writes.
+
+### Fixed
+
+- **Sub-Second `DRIFT_REMAINDER_MS` Accounting in `update_adaptive_drift_trim()`**:
+  - Folds the unapplied sub-second drift remainder (`DRIFT_REMAINDER_MS`, `-999..+999ms`) into `EFFECTIVE_OFFSET_MS` when evaluating real sleep intervals (`EFFECTIVE_SLEPT_SEC >= 300`), preventing integer-second `setback 1s` quantization from falsely resetting `DRIFT_CONVERGED_STREAK` on 1-hour intervals.
+- **Repeated Non-Key Early Hardware Wake Storm Guard (`EARLY_WAKE_COUNT_IN_MINUTE`)**:
+  - Caps the 2-second fast re-suspend on non-key early hardware wakes (`RTC_WOKE_EARLY=1`) to once per minute; if a persistent PMIC low-battery interrupt wakes the kernel a second time within the same minute, `wait_for_event_or_minute()` holds awake for `IDLE_SUSPEND_SECONDS` (`15s`) instead of thrashing 8–9 suspend/resume cycles inside a single minute.
+- **Hot-Path Subshell Fork Removal & Clean `full_refresh` Timing**:
+  - Moved `log_message "full refresh: ..."` outside the `DISPLAY_START_UPTIME_CS ... DISPLAY_END_UPTIME_CS` measurement window and redirected `eips` output to `/dev/null` so `duration_ms` measures pure `eips` execution without FAT32 log I/O overhead.
+  - Guarded `REFRESH_ACTUAL_CLOCK` and `DISPLAY_START_CLOCK` behind `DEBUG_LOG=1` and `DISPLAY_END_CLOCK` behind the timing-unavailable fallback branch, removing redundant `date +%s` forks from the per-minute wake-to-display critical path.
+
 ## 2.5.9 - 2026-10-25
 
 Based on 186.1-hour (7.75-day, `100% -> 3%`) full-cycle empirical runtime telemetry (`kfc.log`, 14,581 lines).
