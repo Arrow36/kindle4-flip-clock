@@ -36,7 +36,7 @@ THEME=light
 TIMEZONE=CST-8
 TIME_SYNC_TIMEOUT=20
 NTP_SERVERS="ntp1.aliyun.com ntp2.aliyun.com ntp.aliyun.com"
-AUTO_TIME_SYNC_INTERVAL_HOURS=6
+AUTO_TIME_SYNC_INTERVAL_HOURS=2
 AUTO_TIME_CHECK_HOURLY=0
 AUTO_DRIFT_CALIBRATION=1
 RTC_DRIFT_COMPENSATION_PPM=5400
@@ -57,7 +57,7 @@ WIFI_FAIL_STREAK=0
 ACCUMULATED_SLEPT_SECONDS=0
 LAST_SAMPLED_VOLTAGE=""
 SETTINGS_VERSION=""
-CURRENT_SETTINGS_VERSION=8
+CURRENT_SETTINGS_VERSION=9
 SETTINGS_MIGRATED=0
 DEBUG_LOG=0
 LOG_MAX_BYTES=4194304
@@ -180,6 +180,9 @@ load_settings() {
       [ "$RTC_WAKE_LEAD_SECONDS" = "1" ] && RTC_WAKE_LEAD_SECONDS=2
       [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = "4" ] && AUTO_TIME_SYNC_INTERVAL_HOURS=6
     fi
+    if [ "$SETTINGS_VERSION" -lt 9 ]; then
+      [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = "6" ] && AUTO_TIME_SYNC_INTERVAL_HOURS=2
+    fi
     SETTINGS_VERSION="$CURRENT_SETTINGS_VERSION"
     SETTINGS_MIGRATED=1
   fi
@@ -187,7 +190,7 @@ load_settings() {
   case "$HOUR_MODE" in 12|24) ;; *) HOUR_MODE=24 ;; esac
   case "$THEME" in light|dark) ;; *) THEME=light ;; esac
   is_uint "$TIME_SYNC_TIMEOUT" || TIME_SYNC_TIMEOUT=20
-  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=6
+  is_uint "$AUTO_TIME_SYNC_INTERVAL_HOURS" || AUTO_TIME_SYNC_INTERVAL_HOURS=2
   is_uint "$RTC_DRIFT_COMPENSATION_PPM" || RTC_DRIFT_COMPENSATION_PPM=0
   is_uint "$IDLE_SUSPEND_SECONDS" || IDLE_SUSPEND_SECONDS=15
   is_uint "$RTC_WAKE_LEAD_SECONDS" || RTC_WAKE_LEAD_SECONDS=2
@@ -529,7 +532,9 @@ update_adaptive_drift_trim() {
   [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 86400 ] || return 0
 
   is_uint "${OFFSET_MS#-}" || return 0
-  [ "${OFFSET_MS#-}" -le 120000 ] || return 0
+  # Do not drop offsets > 120s; line 550 bounds DRIFT_PPM to +/-20000 PPM.
+  # Dropping large offsets created a permanent calibration deadlock over multi-hour intervals.
+  [ "${OFFSET_MS#-}" -le 1800000 ] || return 0
 
   # When actual RTC suspend duration is tracked, compute residual drift rate
   # against actual sleep seconds rather than total wall-clock elapsed time,
@@ -547,6 +552,9 @@ update_adaptive_drift_trim() {
   # was active: positive means the clock still ran fast.
   is_uint "${DRIFT_PPM#-}" || return 0
   [ "${DRIFT_PPM#-}" -le 20000 ] || return 0
+  if [ "${OFFSET_MS#-}" -gt 120000 ]; then
+    log_message "adaptive drift calibration: large offset (${OFFSET_MS}ms); adapting trim with residual rate ${DRIFT_PPM}ppm"
+  fi
 
   # Dynamic damping factor:
   # - Cold start or severe regime shifts (|DRIFT_PPM| >= 3000): aggressive 80% step
@@ -594,10 +602,15 @@ update_adaptive_drift_trim() {
   fi
   CONVERGED_MAX_OFFSET_MS=$(( (CONVERGED_DURATION_SEC * 350) / 1000 ))
   [ "$CONVERGED_MAX_OFFSET_MS" -lt 2000 ] && CONVERGED_MAX_OFFSET_MS=2000
+  [ "$CONVERGED_MAX_OFFSET_MS" -gt 5000 ] && CONVERGED_MAX_OFFSET_MS=5000
   is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
-  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "${EFFECTIVE_OFFSET_MS#-}" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
+  ABS_OFFSET_MS="${EFFECTIVE_OFFSET_MS#-}"
+  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "$ABS_OFFSET_MS" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
     DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
   else
+    if [ "$ABS_OFFSET_MS" -gt 15000 ]; then
+      log_message "adaptive drift: offset exceeds 15s tolerance (${OFFSET_MS}ms); streak reset, collapsing sync interval to 1h"
+    fi
     DRIFT_CONVERGED_STREAK=0
   fi
   NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
@@ -1375,18 +1388,20 @@ refresh_battery_sample_after_hourly_full_refresh() {
         EFFECTIVE_SYNC_INTERVAL_HOURS=1
       elif [ "$WIFI_FAIL_STREAK" -gt 0 ] && [ "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" -gt "$LAST_AUTO_SYNC_EPOCH" ]; then
         # Already proven accurate (streak >= 2), but the scheduled Wi-Fi sync timed out.
-        # Back off progressively (1h -> 3h -> full interval) from the last attempt.
+        # Back off: retry in 1h on first failure, then maintain cruise interval (max 2h).
         SYNC_REF_EPOCH="$LAST_AUTO_SYNC_ATTEMPT_EPOCH"
         if [ "$WIFI_FAIL_STREAK" -eq 1 ]; then
           EFFECTIVE_SYNC_INTERVAL_HOURS=1
         elif [ "$WIFI_FAIL_STREAK" -eq 2 ]; then
-          EFFECTIVE_SYNC_INTERVAL_HOURS=3
+          EFFECTIVE_SYNC_INTERVAL_HOURS=2
           [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt "$AUTO_TIME_SYNC_INTERVAL_HOURS" ] && \
             EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
         else
           EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
         fi
       fi
+      # Cap the maximum blind window to 2 hours when convergence cruise is active
+      [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt 2 ] && EFFECTIVE_SYNC_INTERVAL_HOURS=2
       if [ "$SYNC_REF_EPOCH" -le 0 ] || [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -le 1 ]; then
         # First top-of-the-hour after startup, or unconverged/1h sync interval: always due at :00
         INTERVAL_DUE=1

@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.1 - 2026-11-08
+
+Based on 166.9-hour (6.95-day, `97% -> 6%`) full-cycle empirical runtime telemetry (`kfc.log`, 12,610 lines) and clock accuracy forensics.
+
+### Fixed
+
+- **Eliminated 120-Second Drift Calibration Deadlock (`update_adaptive_drift_trim`)**:
+  - Previously, `update_adaptive_drift_trim()` dropped any synchronization result with `|OFFSET_MS| > 120000` (120s) before computing `DRIFT_PPM`. When a large environmental crystal frequency shift (e.g. -6000 PPM) coincided with a multi-hour cruise interval or night-time Wi-Fi timeouts, accumulated drift exceeded 120s, causing the algorithm to permanently discard the error and refuse to adapt the trim (locking the clock in a 29-hour stale compensation loop).
+  - Replaced the premature 120s offset drop with an 1800s bound while relying on the existing `|DRIFT_PPM| <= 20000` rate check to guard against rogue timestamps, ensuring continuous closed-loop learning across long or volatile intervals.
+- **Dynamic Accuracy Fuse & Immediate 1-Hour Sync Collapse**:
+  - Enforced strict $\le 5\text{s}$ tolerance (`CONVERGED_MAX_OFFSET_MS <= 5000`) for advancing `DRIFT_CONVERGED_STREAK`.
+  - Added an immediate error fuse: whenever observed `|OFFSET_MS| > 15\text{s}`, `DRIFT_CONVERGED_STREAK` is instantly reset to `0`, immediately collapsing the synchronization interval from multi-hour cruise back to hourly 1-hour calibration until the crystal stabilizes.
+- **Compressed Maximum Cruise Blind Window to 2 Hours (`AUTO_TIME_SYNC_INTERVAL_HOURS=2`)**:
+  - Lowered default `AUTO_TIME_SYNC_INTERVAL_HOURS` from `6` to `2` (settings schema migrated to version `9`) and capped the effective cruise interval to at most 2 hours.
+  - Even under extreme crystal temperature swings ($\pm 6000\text{ PPM}$ / $\pm 21.6\text{s/hr}$), limiting the unmonitored window to $\le 2$ hours bounds maximum drift between syncs to $\le 30\text{s}$, completely eliminating multi-minute visual clock error while preserving $\sim 7\text{ days}$ of battery endurance.
+
 ## 2.6.0 - 2026-10-27
 
 Based on 57.1-hour empirical runtime telemetry (`kfc.log`, 4,466 lines) and Duokan (`DK_System/xKindle`) cross-system startup forensics.

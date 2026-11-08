@@ -69,7 +69,7 @@ Based on kernel `/proc/uptime` profiling showing that Kindle 4's BusyBox 1.7.2 (
    - Preserved `RTC_WAKE_LEAD_SECONDS=2` to absorb hardware wake jitter and raised minimum RTC suspend threshold from `2s` to `5s` to avoid `mxc_rtc.0` short-alarm stalls.
 
 4. **Convergence-Gated Auto-Sync Interval (`DRIFT_CONVERGED_STREAK`), Actual Sleep Denominator & Zero-Fork Hot Path**:
-   - **Hourly Sync Until Converged**: Tracks consecutive accurate syncs (`|DRIFT_PPM| <= 300` and `|OFFSET_MS| <= 2000`) via `DRIFT_CONVERGED_STREAK`. While `< 2`, sync runs every `1` hour to rapidly converge; once `>= 2` consecutive syncs are accurate, it switches to `AUTO_TIME_SYNC_INTERVAL_HOURS` (`6` hours default) and reverts to `1` hour if drift exceeds bounds later.
+   - **Hourly Sync Until Converged**: Tracks consecutive accurate syncs (`|DRIFT_PPM| <= 350` and offset $\le 5\text{s}$) via `DRIFT_CONVERGED_STREAK`. While `< 2`, sync runs every `1` hour to rapidly converge; once `>= 2` consecutive syncs are accurate, it switches to `AUTO_TIME_SYNC_INTERVAL_HOURS` (`2` hours default, capped at 2 hours max blind window) and instantly trips an error fuse back to `1` hour if drift exceeds 15 seconds; completely removes the 120s calibration drop to prevent deadlocks under large temperature swings.
    - `update_adaptive_drift_trim()` now computes residual `DRIFT_PPM` against accumulated RTC sleep seconds (`ACCUMULATED_SLEPT_SECONDS`) rather than total wall-clock elapsed time.
    - Replaced `$(cat ...)` and `$(printf ...)` in per-minute hot paths with shell builtins (`read -r` and parameter expansion) and moved log truncation checks to once per hour, eliminating ~55,000 child process forks per day.
 

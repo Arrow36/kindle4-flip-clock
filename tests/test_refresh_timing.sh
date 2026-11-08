@@ -13,19 +13,19 @@ save_settings() { :; }
 SETTINGS_VERSION=3
 RTC_WAKE_LEAD_SECONDS=2
 load_settings
-[ "$SETTINGS_VERSION" = 8 ]
+[ "$SETTINGS_VERSION" = 9 ]
 [ "$RTC_WAKE_LEAD_SECONDS" = 2 ]
 [ "$AUTO_DRIFT_CALIBRATION" = 1 ]
 [ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 0 ]
 [ "$BATTERY_REFRESH_SETTLE_SECONDS" = 0 ]
 
-SETTINGS_VERSION=7
-RTC_WAKE_LEAD_SECONDS=1
-AUTO_TIME_SYNC_INTERVAL_HOURS=4
+SETTINGS_VERSION=8
+RTC_WAKE_LEAD_SECONDS=2
+AUTO_TIME_SYNC_INTERVAL_HOURS=6
 load_settings
-[ "$SETTINGS_VERSION" = 8 ]
+[ "$SETTINGS_VERSION" = 9 ]
 [ "$RTC_WAKE_LEAD_SECONDS" = 2 ]
-[ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 6 ]
+[ "$AUTO_TIME_SYNC_INTERVAL_HOURS" = 2 ]
 
 NEXT_FRAME_EPOCH=120
 NEXT_DISPLAY_CLOCK=120
@@ -230,15 +230,15 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
 
-# Case 6: Converged (DRIFT_CONVERGED_STREAK=2), Interval=4: 3 hours later at 22:00 (not due), 4 hours later at 23:00 (due)
+# Case 6: Converged (DRIFT_CONVERGED_STREAK=2), Interval=4: maximum blind window is capped to 2 hours
 AUTO_TIME_SYNC_INTERVAL_HOURS=4
 LAST_AUTO_SYNC_EPOCH=3600
 LAST_SYNC_EPOCH=3600
-scheduler_now() { echo 14400; }
+scheduler_now() { echo 7200; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 0 ]
-scheduler_now() { echo 18000; }
+scheduler_now() { echo 10800; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = 1 ]
@@ -353,19 +353,28 @@ try_rtc_suspend 3700 2>/dev/null || REJECT_STATUS=$?
 [ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
 rmdir "$POWER_STATE_PATH"
 
-# Test 6-hour convergence retention (slept=20745s, offset=-5879ms -> 283ppm <= 350ppm stays converged)
+# Test 2-hour convergence retention (slept=7000s, offset=-2100ms -> 300ppm <= 350ppm and offset <= 5000ms stays converged)
 DRIFT_CONVERGED_STREAK=2
-ACCUMULATED_SLEPT_SECONDS=20745
-printf "OFFSET_MS=-5879\nELAPSED_SEC=21604\nDRIFT_PPM=272\n" > "$SYNC_STAT_FILE"
+ACCUMULATED_SLEPT_SECONDS=7000
+printf "OFFSET_MS=-2100\nELAPSED_SEC=7200\nDRIFT_PPM=300\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$DRIFT_CONVERGED_STREAK" = "3" ]
 
-# Test 9-hour calibration acceptance (elapsed=32418s <= 86400s is calibrated rather than dropped)
+# Test > 15s offset trips the error fuse: resets streak to 0 and collapses to 1h
 ADAPTIVE_PPM_TRIM=0
 ACCUMULATED_SLEPT_SECONDS=31000
 printf "OFFSET_MS=18600\nELAPSED_SEC=32418\nDRIFT_PPM=-600\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-300" ]
+[ "$DRIFT_CONVERGED_STREAK" = "0" ]
+
+# Test large offset > 120s is calibrated rather than dropped (fixes permanent calibration deadlock)
+ADAPTIVE_PPM_TRIM=0
+ACCUMULATED_SLEPT_SECONDS=25000
+printf "OFFSET_MS=188000\nELAPSED_SEC=25200\nDRIFT_PPM=-7500\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-6016" ]
+[ "$DRIFT_CONVERGED_STREAK" = "0" ]
 
 # Test should_keep_displayed_frame_after_sync prevents backward :00 -> :59 -> :00 double full refresh
 CURRENT_FRAME_EPOCH=3600
@@ -412,7 +421,7 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "0" ]
 
-# Converged (streak=2) at healthy voltage (3800mV): progressive backoff on Wi-Fi failures (1h -> 3h -> 6h)
+# Converged (streak=2) at healthy voltage (3800mV): backoff on Wi-Fi failures capped to 2h max window (1h -> 2h)
 get_battery_voltage() { echo 3800; }
 WIFI_FAIL_STREAK=1
 LAST_AUTO_SYNC_EPOCH=3600
@@ -428,18 +437,18 @@ scheduler_now() { echo 32400; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "0" ]
-scheduler_now() { echo 39600; }
+scheduler_now() { echo 36000; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]
 
 WIFI_FAIL_STREAK=3
-LAST_AUTO_SYNC_ATTEMPT_EPOCH=39600
-scheduler_now() { echo 50400; }
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=36000
+scheduler_now() { echo 39600; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "0" ]
-scheduler_now() { echo 61200; }
+scheduler_now() { echo 43200; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]
