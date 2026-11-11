@@ -2,13 +2,33 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.6.0** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.6.2** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.6.2 (Universal Wi-Fi timeout backoff, post-sync frame preparation & diurnal drift tolerance)
+
+Based on 59.1 hours of empirical telemetry forensics (`kfc.log`, 5,028 lines) and external verification:
+
+1. **Universal Wi-Fi Failure Backoff (`WIFI_FAIL_STREAK`) Independent of Convergence**:
+   - **Rationale**: In v2.6.1, Wi-Fi failure backoff was gated behind `DRIFT_CONVERGED_STREAK >= 2`. When the clock was not yet converged or recovering from thermal drift, router outages caused 20s RF scans every hour (23 timeouts in 59 hours, 460s RF awake), rapidly depleting battery.
+   - **Implementation**: Elevated `WIFI_FAIL_STREAK > 0` progressive backoff (`1h -> 2h -> 3h -> 4h`) to top priority, completely decoupled from convergence state. Protects battery during extended network outages while resuming immediately once Wi-Fi reconnects.
+
+2. **Explicit Next-Minute Card Preparation After Time Sync (`prepare_next_minute`)**:
+   - **Rationale**: When an hourly sync finished and the current displayed frame was kept (`should_keep_displayed_frame_after_sync`), the next minute's card was not explicitly pre-rendered, causing a frame miss at 01:02 and triggering an emergency full PNG fallback (+3.8s delay and high CPU load).
+   - **Implementation**: Added explicit `prepare_next_minute "$DISPLAY_SLOT"` after keeping the displayed frame to ensure Lua worker state stays synchronized.
+
+3. **Decoupled Error Fuse & Diurnal Crystal Drift Tolerance (`CONVERGED_PPM_LIMIT=800`)**:
+   - **Rationale**: Diurnal ambient temperature swings cause up to $\pm 600\text{ PPM}$ natural frequency drift in the 32.768 kHz RTC crystal. The previous 350 PPM and 5s bounds caused perpetual oscillation between 1-hour calibration and cruise mode.
+   - **Implementation**: Widened `CONVERGED_PPM_LIMIT` to 800 PPM with dynamic offset tolerance (`2s ~ 10s`), and decoupled the 15s error fuse so `streak=0` triggers immediately upon reading large offsets regardless of sample eligibility.
+
+4. **Dynamic Wake Lead for Slow RTC Crystals (`EFFECTIVE_PPM < -3000`)**:
+   - **Rationale**: When the crystal runs slow, hardware RTC alarms trigger late in physical time, causing wakeups to occasionally cross the `:00` boundary (+1.11s).
+   - **Implementation**: Dynamically extends the wake lead to 3 seconds (`EFFECTIVE_WAKE_LEAD=3`), providing ample margin for sub-second `usleep` alignment.
 
 ## What changed in 2.6.0 (Duokan hot-switch runtime sanitization, pre-SNTP jump capture, accuracy-gated Wi-Fi power saving & RAM log buffering)
 

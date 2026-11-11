@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.2 - 2026-11-12
+
+Based on 59.1-hour empirical telemetry forensics (`kfc.log`, 5,028 lines) and external verification.
+
+### Fixed
+
+- **Universal Wi-Fi Timeout Backoff Independent of Convergence (`WIFI_FAIL_STREAK`)**:
+  - Lifted progressive Wi-Fi failure backoff (`1h -> 2h -> 3h -> 4h`) to top priority in `refresh_battery_sample_after_hourly_full_refresh`, completely decoupling it from `DRIFT_CONVERGED_STREAK`.
+  - Previously, `elif [ "$WIFI_FAIL_STREAK" -gt 0 ]` was chained behind `if [ "$DRIFT_CONVERGED_STREAK" -lt 2 ]`. When a clock had not yet achieved 2 consecutive converged calibrations and Wi-Fi was unavailable (e.g. router powered down overnight), it retried every single hour without backoff (causing 23 timeouts in 59 hours, 460s of active Wi-Fi RF scanning, and rapid battery depletion).
+  - The universal backoff now applies to all automatic sync attempts when Wi-Fi is unreachable, capping at 4 hours to preserve battery while resuming normal intervals immediately once Wi-Fi succeeds.
+- **Post-Sync Frame Preparation (`prepare_next_minute`) in `should_keep_displayed_frame_after_sync`**:
+  - When automatic SNTP synchronization completes during the top of the hour and `should_keep_displayed_frame_after_sync` determines that the displayed frame matches the new synchronized wall time, it now explicitly prepares the next minute (`prepare_next_minute "$DISPLAY_SLOT"`) after aligning the clock.
+  - Fixes an issue where the background LuaJIT worker retained an outdated cached card for the minute following synchronization (e.g. at 01:02), triggering a frame mismatch, an emergency fallback to the slow PNG renderer (+3.8s delay), and unnecessary CPU load.
+- **Decoupled Error Fuse Streak Reset in `update_adaptive_drift_trim`**:
+  - In `update_adaptive_drift_trim()`, the `|OFFSET_MS| > 15000` (15s) error fuse is now evaluated immediately upon parsing `OFFSET_MS`, before any sample filtering (such as minimum sleep duration or maximum drift bounds) can return early.
+  - Guarantees that any large clock discrepancy instantly breaks multi-hour cruise mode and forces hourly calibration (`DRIFT_CONVERGED_STREAK=0`), even if the sample is rejected for crystal mathematical trim updates.
+- **Diurnal Crystal Drift Tolerance (`CONVERGED_PPM_LIMIT=800` & Dynamic Offset Bound)**:
+  - Widened `CONVERGED_PPM_LIMIT` from 350 to 800 PPM and dynamically scaled `CONVERGED_MAX_OFFSET_MS` as `2000 + (DURATION * 800) / 1000` (clamped between 2,000ms and 10,000ms).
+  - Absorbs realistic day/night ambient temperature swings ($\pm 600\text{ PPM}$) so the clock retains cruise intervals without repeatedly collapsing into 1-hour mode on minor thermal drift.
+- **Dynamic RTC Wake Lead for Slow Hardware Crystals (`EFFECTIVE_PPM < -3000`)**:
+  - When the hardware 32.768 kHz RTC crystal runs significantly slow (`EFFECTIVE_PPM < -3000`), the hardware alarm fires slightly later in real time than nominal.
+  - Automatically increases `EFFECTIVE_WAKE_LEAD` to 3 seconds (`RTC_WAKE_LEAD_SECONDS + 1`), ensuring the kernel wakes up comfortably ahead of the `:00` boundary so sub-second `usleep` alignment can fire frame updates precisely on the second.
+
 ## 2.6.1 - 2026-11-08
 
 Based on 166.9-hour (6.95-day, `97% -> 6%`) full-cycle empirical runtime telemetry (`kfc.log`, 12,610 lines) and clock accuracy forensics.

@@ -173,6 +173,7 @@ BATTERY_REFRESH_SETTLE_SECONDS=0
 # Mock scheduler_now to 19:00:00 (epoch 3600)
 scheduler_now() { echo 3600; }
 time_sync_now() { return 0; }
+start_time_sync() { :; }
 
 # Case 1: First top-of-the-hour after startup (LAST_AUTO_SYNC_EPOCH=0, startup at 1620, elapsed=1980s >= 300s)
 LAST_AUTO_SYNC_EPOCH=0
@@ -353,14 +354,22 @@ try_rtc_suspend 3700 2>/dev/null || REJECT_STATUS=$?
 [ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
 rmdir "$POWER_STATE_PATH"
 
-# Test 2-hour convergence retention (slept=7000s, offset=-2100ms -> 300ppm <= 350ppm and offset <= 5000ms stays converged)
+# Test 2-hour convergence retention (slept=7000s, offset=-4900ms -> 700ppm <= 800ppm and offset <= 10000ms stays converged)
 DRIFT_CONVERGED_STREAK=2
 ACCUMULATED_SLEPT_SECONDS=7000
-printf "OFFSET_MS=-2100\nELAPSED_SEC=7200\nDRIFT_PPM=300\n" > "$SYNC_STAT_FILE"
+printf "OFFSET_MS=-4900\nELAPSED_SEC=7200\nDRIFT_PPM=700\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$DRIFT_CONVERGED_STREAK" = "3" ]
 
-# Test > 15s offset trips the error fuse: resets streak to 0 and collapses to 1h
+# Test > 15s offset trips the error fuse even when sample is rejected for trim learning (ELAPSED < 600s)
+DRIFT_CONVERGED_STREAK=3
+ADAPTIVE_PPM_TRIM=0
+printf "OFFSET_MS=18600\nELAPSED_SEC=300\nDRIFT_PPM=-600\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "0" ]
+[ "$DRIFT_CONVERGED_STREAK" = "0" ]
+
+# Test > 15s offset trips the error fuse on valid sample: resets streak to 0 and collapses to 1h
 ADAPTIVE_PPM_TRIM=0
 ACCUMULATED_SLEPT_SECONDS=31000
 printf "OFFSET_MS=18600\nELAPSED_SEC=32418\nDRIFT_PPM=-600\n" > "$SYNC_STAT_FILE"
@@ -387,6 +396,31 @@ if should_keep_displayed_frame_after_sync 3660; then exit 1; fi
 SYNC_REASON=manual
 if should_keep_displayed_frame_after_sync 3609; then exit 1; fi
 
+# Test post-sync frame preparation in should_keep_displayed_frame_after_sync branch
+SYNC_REASON=auto
+PREPARED_MINUTE=0
+prepare_next_minute() { PREPARED_MINUTE=1; }
+SYSTEM_NOW=3609
+if should_keep_displayed_frame_after_sync "$SYSTEM_NOW"; then
+  NEXT_FRAME_EPOCH=$((CURRENT_FRAME_EPOCH + 60))
+  NEXT_DISPLAY_CLOCK="$NEXT_FRAME_EPOCH"
+  prepare_next_minute
+fi
+[ "$PREPARED_MINUTE" = "1" ]
+[ "$NEXT_DISPLAY_CLOCK" = "3660" ]
+
+# Test dynamic wake lead adds 1s when crystal is running slow (EFFECTIVE_PPM < -3000)
+RTC_WAKE_LEAD_SECONDS=2
+EFFECTIVE_PPM=0
+EFFECTIVE_WAKE_LEAD="$RTC_WAKE_LEAD_SECONDS"
+if [ "$EFFECTIVE_PPM" -lt -3000 ]; then EFFECTIVE_WAKE_LEAD=$((RTC_WAKE_LEAD_SECONDS + 1)); fi
+[ "$EFFECTIVE_WAKE_LEAD" = "2" ]
+
+EFFECTIVE_PPM=-6258
+EFFECTIVE_WAKE_LEAD="$RTC_WAKE_LEAD_SECONDS"
+if [ "$EFFECTIVE_PPM" -lt -3000 ]; then EFFECTIVE_WAKE_LEAD=$((RTC_WAKE_LEAD_SECONDS + 1)); fi
+[ "$EFFECTIVE_WAKE_LEAD" = "3" ]
+
 # Test sub-second DRIFT_REMAINDER_MS folding in update_adaptive_drift_trim
 DRIFT_CONVERGED_STREAK=1
 DRIFT_REMAINDER_MS=-500
@@ -396,41 +430,23 @@ update_adaptive_drift_trim
 [ "$DRIFT_CONVERGED_STREAK" = "2" ]
 [ "$DRIFT_REMAINDER_MS" = "0" ]
 
-# Test accuracy-gated Wi-Fi retry backoff and low-battery threshold
+# Test universal Wi-Fi failure progressive backoff (applies even when unconverged, streak=1)
 AUTO_TIME_SYNC_INTERVAL_HOURS=6
 CURRENT_FRAME_EPOCH=7200
 LAST_SYNC_EPOCH=3600
 LAST_AUTO_SYNC_EPOCH=3600
 LAST_AUTO_SYNC_ATTEMPT_EPOCH=25200
-# Unconverged (streak=1): always retries after 1h even when WIFI_FAIL_STREAK=3 and battery=3580mV
 DRIFT_CONVERGED_STREAK=1
-WIFI_FAIL_STREAK=3
-get_battery_voltage() { echo 3580; }
-rm -f "$RUNTIME_DIR/battery.volt"
-scheduler_now() { echo 28800; }
-SYNC_PID=""
-refresh_battery_sample_after_hourly_full_refresh >/dev/null
-[ "$AUTO_SYNC_DUE" = "1" ]
-
-# Converged (streak=2): skips Wi-Fi at 3580mV (< 3600mV)
-DRIFT_CONVERGED_STREAK=2
-WIFI_FAIL_STREAK=0
-LAST_AUTO_SYNC_EPOCH=3600
-scheduler_now() { echo 25200; }
-SYNC_PID=""
-refresh_battery_sample_after_hourly_full_refresh >/dev/null
-[ "$AUTO_SYNC_DUE" = "0" ]
-
-# Converged (streak=2) at healthy voltage (3800mV): backoff on Wi-Fi failures capped to 2h max window (1h -> 2h)
-get_battery_voltage() { echo 3800; }
 WIFI_FAIL_STREAK=1
-LAST_AUTO_SYNC_EPOCH=3600
-LAST_AUTO_SYNC_ATTEMPT_EPOCH=25200
+get_battery_voltage() { echo 3800; }
+rm -f "$RUNTIME_DIR/battery.volt"
+# 1st failure: retries after 1h (25200 + 3600 = 28800)
 scheduler_now() { echo 28800; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]
 
+# 2nd failure: backs off to 2h (28800 + 7200 = 36000)
 WIFI_FAIL_STREAK=2
 LAST_AUTO_SYNC_ATTEMPT_EPOCH=28800
 scheduler_now() { echo 32400; }
@@ -442,13 +458,26 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]
 
+# 3rd failure: backs off to 3h (36000 + 10800 = 46800)
 WIFI_FAIL_STREAK=3
 LAST_AUTO_SYNC_ATTEMPT_EPOCH=36000
 scheduler_now() { echo 39600; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "0" ]
-scheduler_now() { echo 43200; }
+scheduler_now() { echo 46800; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
+
+# 4th failure: backs off to 4h (46800 + 14400 = 61200)
+WIFI_FAIL_STREAK=4
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=46800
+scheduler_now() { echo 57600; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "0" ]
+scheduler_now() { echo 61200; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]

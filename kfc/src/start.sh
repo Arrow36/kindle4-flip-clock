@@ -528,10 +528,22 @@ update_adaptive_drift_trim() {
   ACCUMULATED_SLEPT_SECONDS=0
   rm -f "$RUNTIME_DIR/accumulated_slept"
 
+  is_uint "${OFFSET_MS#-}" || return 0
+  ABS_RAW_OFFSET_MS="${OFFSET_MS#-}"
+  is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
+  # Dynamic error fuse: if actual offset exceeds 15s tolerance, immediately reset
+  # convergence streak and trigger 1h sync collapse, BEFORE evaluating whether this
+  # sample is accepted for mathematical trim learning.
+  if [ "$ABS_RAW_OFFSET_MS" -gt 15000 ]; then
+    if [ "$DRIFT_CONVERGED_STREAK" -gt 0 ]; then
+      log_message "adaptive drift: offset exceeds 15s tolerance (${OFFSET_MS}ms); streak reset, collapsing sync interval to 1h"
+    fi
+    DRIFT_CONVERGED_STREAK=0
+  fi
+
   is_uint "$ELAPSED_SEC" || return 0
   [ "$ELAPSED_SEC" -ge 600 ] && [ "$ELAPSED_SEC" -le 86400 ] || return 0
 
-  is_uint "${OFFSET_MS#-}" || return 0
   # Do not drop offsets > 120s; line 550 bounds DRIFT_PPM to +/-20000 PPM.
   # Dropping large offsets created a permanent calibration deadlock over multi-hour intervals.
   [ "${OFFSET_MS#-}" -le 1800000 ] || return 0
@@ -600,17 +612,14 @@ update_adaptive_drift_trim() {
   if ! is_uint "$CONVERGED_DURATION_SEC" || [ "$CONVERGED_DURATION_SEC" -lt 3600 ]; then
     CONVERGED_DURATION_SEC="$ELAPSED_SEC"
   fi
-  CONVERGED_MAX_OFFSET_MS=$(( (CONVERGED_DURATION_SEC * 350) / 1000 ))
+  # Allow realistic diurnal crystal temperature drift (~2.8s/hr, 800 PPM)
+  CONVERGED_MAX_OFFSET_MS=$(( 2000 + (CONVERGED_DURATION_SEC * 800) / 1000 ))
   [ "$CONVERGED_MAX_OFFSET_MS" -lt 2000 ] && CONVERGED_MAX_OFFSET_MS=2000
-  [ "$CONVERGED_MAX_OFFSET_MS" -gt 5000 ] && CONVERGED_MAX_OFFSET_MS=5000
-  is_uint "$DRIFT_CONVERGED_STREAK" || DRIFT_CONVERGED_STREAK=0
+  [ "$CONVERGED_MAX_OFFSET_MS" -gt 10000 ] && CONVERGED_MAX_OFFSET_MS=10000
   ABS_OFFSET_MS="${EFFECTIVE_OFFSET_MS#-}"
-  if [ "$ABS_DRIFT_PPM" -le 350 ] && [ "$ABS_OFFSET_MS" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
+  if [ "$ABS_DRIFT_PPM" -le 800 ] && [ "$ABS_OFFSET_MS" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
     DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
   else
-    if [ "$ABS_OFFSET_MS" -gt 15000 ]; then
-      log_message "adaptive drift: offset exceeds 15s tolerance (${OFFSET_MS}ms); streak reset, collapsing sync interval to 1h"
-    fi
     DRIFT_CONVERGED_STREAK=0
   fi
   NEXT_EFF_PPM=$(calc_effective_ppm "" "$RTC_DRIFT_COMPENSATION_PPM" "$ADAPTIVE_PPM_TRIM")
@@ -1384,24 +1393,30 @@ refresh_battery_sample_after_hourly_full_refresh() {
       is_uint "$WIFI_FAIL_STREAK" || WIFI_FAIL_STREAK=0
       is_uint "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" || LAST_AUTO_SYNC_ATTEMPT_EPOCH=0
       SYNC_REF_EPOCH="$LAST_AUTO_SYNC_EPOCH"
-      if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -lt 2 ]; then
-        EFFECTIVE_SYNC_INTERVAL_HOURS=1
-      elif [ "$WIFI_FAIL_STREAK" -gt 0 ] && [ "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" -gt "$LAST_AUTO_SYNC_EPOCH" ]; then
-        # Already proven accurate (streak >= 2), but the scheduled Wi-Fi sync timed out.
-        # Back off: retry in 1h on first failure, then maintain cruise interval (max 2h).
+      if [ "$WIFI_FAIL_STREAK" -gt 0 ] && [ "$LAST_AUTO_SYNC_ATTEMPT_EPOCH" -gt "$LAST_AUTO_SYNC_EPOCH" ]; then
+        # Wi-Fi failed or timed out: back off progressively from the last attempt time
+        # regardless of whether the crystal was converged, preventing nighttime RF battery drain.
         SYNC_REF_EPOCH="$LAST_AUTO_SYNC_ATTEMPT_EPOCH"
         if [ "$WIFI_FAIL_STREAK" -eq 1 ]; then
           EFFECTIVE_SYNC_INTERVAL_HOURS=1
         elif [ "$WIFI_FAIL_STREAK" -eq 2 ]; then
           EFFECTIVE_SYNC_INTERVAL_HOURS=2
-          [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt "$AUTO_TIME_SYNC_INTERVAL_HOURS" ] && \
-            EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
+        elif [ "$WIFI_FAIL_STREAK" -eq 3 ]; then
+          EFFECTIVE_SYNC_INTERVAL_HOURS=3
         else
-          EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
+          EFFECTIVE_SYNC_INTERVAL_HOURS=4
         fi
+      elif [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -lt 2 ]; then
+        # Normal operation, unconverged: 1-hour intervals to rapidly lock crystal trim
+        EFFECTIVE_SYNC_INTERVAL_HOURS=1
+      else
+        # Normal operation, converged: cruise at configured interval (capped to 2h)
+        EFFECTIVE_SYNC_INTERVAL_HOURS="$AUTO_TIME_SYNC_INTERVAL_HOURS"
       fi
-      # Cap the maximum blind window to 2 hours when convergence cruise is active
-      [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt 2 ] && EFFECTIVE_SYNC_INTERVAL_HOURS=2
+      # When Wi-Fi is healthy (WIFI_FAIL_STREAK == 0), cap maximum cruise window to 2 hours
+      if [ "$WIFI_FAIL_STREAK" -eq 0 ] && [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -gt 2 ]; then
+        EFFECTIVE_SYNC_INTERVAL_HOURS=2
+      fi
       if [ "$SYNC_REF_EPOCH" -le 0 ] || [ "$EFFECTIVE_SYNC_INTERVAL_HOURS" -le 1 ]; then
         # First top-of-the-hour after startup, or unconverged/1h sync interval: always due at :00
         INTERVAL_DUE=1
@@ -1627,7 +1642,12 @@ wait_for_event_or_minute() {
       return
     fi
     IDLE_DEADLINE=$((LAST_INTERACTION_CLOCK + IDLE_SUSPEND_SECONDS))
-    WAKE_CLOCK=$((NEXT_DISPLAY_CLOCK - RTC_WAKE_LEAD_SECONDS))
+    EFFECTIVE_WAKE_LEAD="$RTC_WAKE_LEAD_SECONDS"
+    is_uint "${EFFECTIVE_PPM#-}" || EFFECTIVE_PPM=0
+    if [ "$EFFECTIVE_PPM" -lt -3000 ]; then
+      EFFECTIVE_WAKE_LEAD=$((RTC_WAKE_LEAD_SECONDS + 1))
+    fi
+    WAKE_CLOCK=$((NEXT_DISPLAY_CLOCK - EFFECTIVE_WAKE_LEAD))
     # Match try_rtc_suspend's >= 5s minimum alarm requirement (WAKE_CLOCK - NOW_CLOCK >= 5).
     LATEST_SUSPEND_CLOCK=$((WAKE_CLOCK - 4))
     if [ -z "$SYNC_PID" ] && ! next_render_in_progress && \
@@ -1961,6 +1981,7 @@ main() {
             REFRESH_BOUNDARY_UPTIME_CS=""
             REFRESH_PLANNED_START_UPTIME_CS=""
             log_message "virtual clock aligned: system=$SYSTEM_NOW current=$CURRENT_FRAME_EPOCH next=$NEXT_FRAME_EPOCH source=system display_clock=$NEXT_DISPLAY_CLOCK"
+            prepare_next_minute
           else
             cancel_next_frame_render
             initialize_virtual_clock
