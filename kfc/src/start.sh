@@ -569,20 +569,27 @@ update_adaptive_drift_trim() {
   fi
 
   # Dynamic damping factor:
+  # - Bimodal crystal mode jump (|DRIFT_PPM| >= 8000 over >= 1800s of actual sleep):
+  #   100% undamped step (clamped to +/-16000 PPM) to lock onto the new resonance
+  #   mode in a single cycle (e.g. -5249 -> +7405 PPM mode jump).
   # - Cold start or severe regime shifts (|DRIFT_PPM| >= 3000): aggressive 80% step
-  #   to converge rapidly in 1-2 hours instead of 5-6 hours.
+  #   (clamped to +/-10000 PPM) to converge rapidly in 1-2 hours.
   # - Transition zone (1500 <= |DRIFT_PPM| < 3000): 60% step.
   # - Steady state (|DRIFT_PPM| < 1500): 50% critical damping to filter noise/jitter.
   ABS_DRIFT_PPM="${DRIFT_PPM#-}"
-  if [ "$ABS_DRIFT_PPM" -ge 3000 ]; then
+  MAX_ADAPT_STEP=10000
+  if [ "$ABS_DRIFT_PPM" -ge 8000 ] && [ "$EFFECTIVE_SLEPT_SEC" -ge 1800 ]; then
+    ADAPT_STEP="$DRIFT_PPM"
+    MAX_ADAPT_STEP=16000
+  elif [ "$ABS_DRIFT_PPM" -ge 3000 ]; then
     ADAPT_STEP=$(( DRIFT_PPM * 4 / 5 ))
   elif [ "$ABS_DRIFT_PPM" -ge 1500 ]; then
     ADAPT_STEP=$(( DRIFT_PPM * 3 / 5 ))
   else
     ADAPT_STEP=$(( DRIFT_PPM / 2 ))
   fi
-  [ "$ADAPT_STEP" -gt 10000 ] && ADAPT_STEP=10000
-  [ "$ADAPT_STEP" -lt -10000 ] && ADAPT_STEP=-10000
+  [ "$ADAPT_STEP" -gt "$MAX_ADAPT_STEP" ] && ADAPT_STEP="$MAX_ADAPT_STEP"
+  [ "$ADAPT_STEP" -lt "-$MAX_ADAPT_STEP" ] && ADAPT_STEP="-$MAX_ADAPT_STEP"
 
   CURRENT_VOLT=""
   [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
@@ -1434,7 +1441,9 @@ refresh_battery_sample_after_hourly_full_refresh() {
         [ -r "$RUNTIME_DIR/battery.volt" ] && read -r CURRENT_SYNC_VOLT < "$RUNTIME_DIR/battery.volt" 2>/dev/null || true
         is_uint "$CURRENT_SYNC_VOLT" || CURRENT_SYNC_VOLT=$(get_battery_voltage)
         LOW_BATT_SYNC_LIMIT=3550
-        if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && [ "$DRIFT_CONVERGED_STREAK" -ge 2 ]; then
+        is_uint "${ADAPTIVE_PPM_TRIM#-}" || ADAPTIVE_PPM_TRIM=0
+        if [ "$AUTO_DRIFT_CALIBRATION" = "1" ] && \
+           { [ "$DRIFT_CONVERGED_STREAK" -ge 1 ] || [ "$ADAPTIVE_PPM_TRIM" -ne 0 ]; }; then
           LOW_BATT_SYNC_LIMIT=3600
         fi
         if is_uint "$CURRENT_SYNC_VOLT" && [ "$CURRENT_SYNC_VOLT" -lt "$LOW_BATT_SYNC_LIMIT" ]; then

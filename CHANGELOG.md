@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.3 - 2026-11-20
+
+Based on 187.44-hour (7.81-day, `100% -> 6%`, `0.501%/h` average drain, `100%` partial-refresh hit rate across `11,061` ordinary minutes) full-cycle empirical validation of v2.6.2 (`kfc.log`, 15,866 lines).
+
+### Changed
+
+- **Unified `3600mV` Low-Battery Protection Once Trim Is Calibrated (`refresh_battery_sample_after_hourly_full_refresh`)**:
+  - Previously, the `3600mV` (~12% battery) automatic Wi-Fi skip threshold only activated when `DRIFT_CONVERGED_STREAK >= 2`. If a late-discharge retry happened when `streak` was temporarily `0` or `1`, automatic Wi-Fi fell back to the `3550mV` threshold, causing a high-current Wi-Fi burst near `9%` battery that collapsed terminal voltage to `6% (3530mV)` and triggered repeated PMIC brownout wakes.
+  - Raised the automatic background Wi-Fi skip floor to `3600mV` whenever `DRIFT_CONVERGED_STREAK >= 1` or a calibrated non-zero `ADAPTIVE_PPM_TRIM` exists (leaving `3550mV` strictly for uncalibrated cold starts and manual key syncs), allowing the remaining battery tail to cruise smoothly on local RTC drift compensation.
+- **Single-Step Bimodal Crystal Mode-Jump Convergence (`update_adaptive_drift_trim`)**:
+  - Empirical telemetry captured a sudden hardware 32.768 kHz RTC bimodal resonance mode jump from `-5249 PPM` to `+7500 PPM` (`residual=+12,657 PPM`). With the previous `80%` damping ratio and `10,000 PPM` step cap, convergence required 3–4 sequential hourly re-calibrations to close the gap.
+  - Added an undamped `100%` single-step branch (step clamp widened to `+/-16000 PPM`) whenever observed `|DRIFT_PPM| >= 8000` over at least `1800s` of actual sleep (`EFFECTIVE_SLEPT_SEC >= 1800`), locking onto the new crystal resonance mode in a single calibration cycle.
+
 ## 2.6.2 - 2026-11-12
 
 Based on 59.1-hour empirical telemetry forensics (`kfc.log`, 5,028 lines) and external verification.

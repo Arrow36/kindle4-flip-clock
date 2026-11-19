@@ -385,6 +385,16 @@ update_adaptive_drift_trim
 [ "$ADAPTIVE_PPM_TRIM" = "-6016" ]
 [ "$DRIFT_CONVERGED_STREAK" = "0" ]
 
+# Test bimodal crystal mode jump (|DRIFT_PPM| >= 8000 over >= 1800s sleep) uses 100% single-step convergence up to 16000 PPM
+ADAPTIVE_PPM_TRIM=-10649
+DRIFT_CONVERGED_STREAK=22
+DRIFT_REMAINDER_MS=0
+ACCUMULATED_SLEPT_SECONDS=6840
+printf "OFFSET_MS=-86559\nELAPSED_SEC=7109\nDRIFT_PPM=-12175\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "2005" ]
+[ "$DRIFT_CONVERGED_STREAK" = "0" ]
+
 # Test should_keep_displayed_frame_after_sync prevents backward :00 -> :59 -> :00 double full refresh
 CURRENT_FRAME_EPOCH=3600
 SYNC_REASON=auto
@@ -481,6 +491,28 @@ scheduler_now() { echo 61200; }
 SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "1" ]
+
+# Test unified 3600mV low-battery protection:
+# 1. Cold start (ADAPTIVE_PPM_TRIM=0, DRIFT_CONVERGED_STREAK=0): allows sync at 3580mV (>= 3550mV)
+WIFI_FAIL_STREAK=0
+ADAPTIVE_PPM_TRIM=0
+DRIFT_CONVERGED_STREAK=0
+LAST_AUTO_SYNC_EPOCH=3600
+LAST_AUTO_SYNC_ATTEMPT_EPOCH=3600
+get_battery_voltage() { echo 3580; }
+rm -f "$RUNTIME_DIR/battery.volt"
+scheduler_now() { echo 7200; }
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "1" ]
+
+# 2. Calibrated trim (ADAPTIVE_PPM_TRIM=2350, even when DRIFT_CONVERGED_STREAK=0): skips auto-sync at 3580mV (< 3600mV)
+ADAPTIVE_PPM_TRIM=2350
+DRIFT_CONVERGED_STREAK=0
+rm -f "$RUNTIME_DIR/battery.volt"
+SYNC_PID=""
+refresh_battery_sample_after_hourly_full_refresh >/dev/null
+[ "$AUTO_SYNC_DUE" = "0" ]
 
 rm -rf "$RUNTIME_DIR"
 

@@ -2,13 +2,25 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.6.2** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.6.3** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.6.3 (7.81-day battery milestone, unified 3600mV low-battery protection & single-step bimodal mode-jump convergence)
+
+Based on 187.44 hours (7.81 days, `100% -> 6%`, `0.501%/h` average drain, `100%` partial-refresh hit rate across `11,061` ordinary minutes) of full-cycle empirical telemetry in v2.6.2 (`kfc.log`, 15,866 lines):
+
+1. **Unified `3600mV` Low-Battery Auto-Sync Protection Once Calibrated**:
+   - **Rationale**: Previously, skipping automatic background Wi-Fi below `3600mV` (~12% battery) required `DRIFT_CONVERGED_STREAK >= 2`. A late-discharge retry near `9%` when `streak < 2` fell back to `3550mV`, collapsing terminal voltage to `3530mV` and inducing PMIC brownout wakes.
+   - **Implementation**: Applies the `3600mV` auto-sync floor whenever `DRIFT_CONVERGED_STREAK >= 1` or a calibrated non-zero `ADAPTIVE_PPM_TRIM` exists, reserving `3550mV` strictly for uncalibrated cold starts and manual key syncs.
+
+2. **Single-Step Bimodal Crystal Mode-Jump Convergence (`|DRIFT_PPM| >= 8000`)**:
+   - **Rationale**: Telemetry captured an abrupt hardware 32.768 kHz RTC bimodal resonance mode jump from `-5249 PPM` to `+7500 PPM` (`residual=+12,657 PPM`), which took 3–4 hours to settle under the `80%` damping and `10,000 PPM` step cap.
+   - **Implementation**: Adds an undamped `100%` step branch (clamped to `+/-16000 PPM`) when observed `|DRIFT_PPM| >= 8000` over `>= 1800s` of actual sleep, snapping directly onto the new crystal mode in a single calibration.
 
 ## What changed in 2.6.2 (Universal Wi-Fi timeout backoff, post-sync frame preparation & diurnal drift tolerance)
 
