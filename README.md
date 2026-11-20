@@ -2,13 +2,28 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.6.3** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.6.4** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.6.4 的主要修改（解除 KUAL `nice=5` 优先级限制、修复回复管道令牌错位与深度清理多看脚本残留）
+
+基于 v2.6.3 16 小时实测日志与多看 `DIAGNOSTIC.log` 交叉取证，根治多看“切换到原系统”（`Exit 4`）热切后出现的刷屏慢 4 倍（`80ms`）、切屏晚 1 秒（`+950ms`）及高耗电（`1.54%/h`）三项底层问题：
+
+1. **启动立即恢复 `nice=0` 调度优先级（`restore_normal_priority`）并关闭 `ignore_nice_load`**
+   - **修改理由**：KUAL Kindlet 启动的脚本与子进程默认带有 `nice=5` 低优先级枷锁（Linux CFS 权重仅 335 vs 普通进程 1024），一旦遭遇后台竞争会被剥夺 75.3% CPU 时间片（正好变慢 4.057 倍），且内核 `ondemand` 的 `ignore_nice_load=1` 会忽略其升频请求。
+   - **技术实现**：`main()` 入口及净化函数立即将主脚本与 `render_server.lua` 重置为 `nice=0`，并将 `ondemand/ignore_nice_load` 设为 `0`、恢复 `scaling_max_freq`。
+
+2. **修复 `wait_renderer_reply()` 回复管道（`fd 9`）令牌错位导致 `WAIT_UNTIL` 跌入 1 秒轮询**
+   - **修改理由**：此前仅在状态文件未生成时读取 `fd 9`；当快速请求抢先写完状态文件导致令牌未被取走时，下一次 `WAIT_UNTIL` 会直接读走遗留令牌并跌入 `sleep 1`（1000ms）粗粒度轮询。
+   - **技术实现**：改为每次请求无条件按一对一节奏消费 `fd 9` 令牌，并在等待循环内优先阻塞读 `fd 9`，彻底锁死 `+180ms` 毫秒级整点准时切屏。
+
+3. **基于 `/proc/[0-9]*/cmdline` 深度清理多看 `/bin/sh` 包装进程**
+   - **技术实现**：扫描 `/proc/[0-9]*/cmdline` 精准查杀以 `sh` 进程名伪装残留的 `S96DK_run`、`DK_run`、`DK_switch`、`S96boot_finished`、`rundk.sh` 等多看脚本，并向 `kfc.log` 输出 `nice`、调频器与 `/proc/loadavg` 自检摘要。
 
 ## 2.6.3 的主要修改（7.81 天实测续航里程碑、3600mV 统一低电保护与晶振跨模态一步收敛）
 

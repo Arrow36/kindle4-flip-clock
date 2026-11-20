@@ -439,20 +439,75 @@ cleanup() {
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
 }
+restore_normal_priority() {
+  CURRENT_NICE=$(nice 2>/dev/null) || CURRENT_NICE=""
+  if is_uint "$CURRENT_NICE" && [ "$CURRENT_NICE" -gt 0 ]; then
+    renice -n "-$CURRENT_NICE" $$ >/dev/null 2>&1 || \
+      renice 0 -p $$ >/dev/null 2>&1 || \
+      renice 0 $$ >/dev/null 2>&1 || true
+  fi
+  if [ -n "${RENDER_SERVER_PID:-}" ]; then
+    renice 0 -p "$RENDER_SERVER_PID" >/dev/null 2>&1 || \
+      renice 0 "$RENDER_SERVER_PID" >/dev/null 2>&1 || true
+  fi
+}
+
 sanitize_runtime_environment() {
+  restore_normal_priority
   # Terminate residual Duokan background daemons and stray native framework or
   # indexer processes that can survive a Duokan "Switch to Kindle" hot-switch
   # and cause 100% CPU contention or /mnt/us FAT32 I/O stalls.
   for BG_PROC in KindleApp ebook lcrun UsbSignal.bin BatterySignal.bin \
                  Charging.bin notCharging.bin PowerState.bin suspending.bin \
-                 mplayer miniftp cvm mesquite webreader phd tmd; do
+                 mplayer miniftp cvm mesquite webreader phd tmd \
+                 DK_run DK_switch S96DK_run S95DK_switch S96boot_finished \
+                 boot_finished rundk.sh WaiteAKey; do
     killall -9 "$BG_PROC" >/dev/null 2>&1 || true
   done
   killall -9 lipc-wait-event >/dev/null 2>&1 || true
-  CPU_GOV_PATH="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-  if [ -w "$CPU_GOV_PATH" ]; then
-    echo ondemand > "$CPU_GOV_PATH" 2>/dev/null || true
+
+  # Scan /proc/<pid>/cmdline to catch "/bin/sh /etc/rc5.d/S96DK_run",
+  # "/bin/sh /etc/rc5.d/S96boot_finished", or "/DuoKan/..." wrapper shells
+  # whose process comm is "sh" and therefore invisible to killall.
+  for PROC_CMD in /proc/[0-9]*/cmdline; do
+    [ -r "$PROC_CMD" ] || continue
+    PROC_DIR=${PROC_CMD%/cmdline}
+    PROC_PID=${PROC_DIR#/proc/}
+    is_uint "$PROC_PID" || continue
+    [ "$PROC_PID" -eq "$$" ] && continue
+    [ "$PROC_PID" -eq "${RENDER_SERVER_PID:-0}" ] && continue
+    [ "$PROC_PID" -eq "${KEY_PID:-0}" ] && continue
+    CMD_TEXT=$(tr '\000' ' ' < "$PROC_CMD" 2>/dev/null) || CMD_TEXT=""
+    case "$CMD_TEXT" in
+      *DK_run*|*DK_switch*|*S96DK_run*|*S95DK_switch*|*rundk.sh*|*/DuoKan/*|*DK_System*|*S96boot_finished*|*boot_finished*|*/usr/java/*|*cvm*)
+        kill -9 "$PROC_PID" >/dev/null 2>&1 || true
+        log_message "sanitized stray process: pid=$PROC_PID cmd=$CMD_TEXT"
+        ;;
+    esac
+  done
+
+  CPU_FREQ_DIR="/sys/devices/system/cpu/cpu0/cpufreq"
+  if [ -w "$CPU_FREQ_DIR/scaling_governor" ]; then
+    echo ondemand > "$CPU_FREQ_DIR/scaling_governor" 2>/dev/null || true
   fi
+  if [ -w "$CPU_FREQ_DIR/ondemand/ignore_nice_load" ]; then
+    echo 0 > "$CPU_FREQ_DIR/ondemand/ignore_nice_load" 2>/dev/null || true
+  fi
+  if [ -r "$CPU_FREQ_DIR/cpuinfo_max_freq" ] && [ -w "$CPU_FREQ_DIR/scaling_max_freq" ]; then
+    MAX_CPU_FREQ=""
+    read -r MAX_CPU_FREQ < "$CPU_FREQ_DIR/cpuinfo_max_freq" 2>/dev/null || true
+    if is_uint "$MAX_CPU_FREQ" && [ "$MAX_CPU_FREQ" -gt 0 ]; then
+      echo "$MAX_CPU_FREQ" > "$CPU_FREQ_DIR/scaling_max_freq" 2>/dev/null || true
+    fi
+  fi
+  CUR_GOV=""
+  CUR_FREQ=""
+  CUR_LOAD=""
+  [ -r "$CPU_FREQ_DIR/scaling_governor" ] && read -r CUR_GOV < "$CPU_FREQ_DIR/scaling_governor" 2>/dev/null || true
+  [ -r "$CPU_FREQ_DIR/scaling_cur_freq" ] && read -r CUR_FREQ < "$CPU_FREQ_DIR/scaling_cur_freq" 2>/dev/null || true
+  [ -r /proc/loadavg ] && read -r CUR_LOAD < /proc/loadavg 2>/dev/null || true
+  CUR_NICE=$(nice 2>/dev/null) || CUR_NICE="unknown"
+  log_message "runtime environment sanitized: nice=${CUR_NICE} gov=${CUR_GOV:-unknown} freq=${CUR_FREQ:-unknown} load=${CUR_LOAD:-unknown}"
   sync >/dev/null 2>&1 || true
 }
 calc_battery_from_voltage() {
@@ -935,7 +990,7 @@ wait_renderer_reply() {
   STATUS_PATH="$1"
   [ "$RENDER_SERVER_READY" = "1" ] || return 1
   [ -n "$RENDER_SERVER_PID" ] && kill -0 "$RENDER_SERVER_PID" 2>/dev/null || return 1
-  if [ "$RENDER_REPLY_READY" = "1" ] && [ ! -f "$STATUS_PATH" ]; then
+  if [ "$RENDER_REPLY_READY" = "1" ]; then
     read -r _ <&9 || true
   fi
   if [ ! -f "$STATUS_PATH" ]; then
@@ -943,6 +998,10 @@ wait_renderer_reply() {
     while [ ! -f "$STATUS_PATH" ]; do
       if ! kill -0 "$RENDER_SERVER_PID" 2>/dev/null; then
         return 1
+      fi
+      if [ "$RENDER_REPLY_READY" = "1" ]; then
+        read -r _ <&9 || true
+        [ -f "$STATUS_PATH" ] && break
       fi
       SERVER_WAIT_NOW=$(date +%s)
       if [ "$SERVER_WAIT_NOW" -ge "$SERVER_WAIT_DEADLINE" ]; then
@@ -1869,6 +1928,7 @@ publish_minute_frame() {
 }
 main() {
   mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
+  restore_normal_priority
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \
     "$CURRENT_FRAME" "$NEXT_FRAME" "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" \
     "$NEXT_FRAME_META" \

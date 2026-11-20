@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.4 - 2026-11-20
+
+Based on 16-hour v2.6.3 empirical telemetry (`kfc.log`, 1,402 lines) cross-referenced against Duokan `DIAGNOSTIC.log` and 8 historical runs, resolving why launches immediately after a Duokan `"Switch to kindle"` (`Exit 4`) hot-switch exhibited `80ms` partial refreshes (vs `20ms`), `620ms` full refreshes (vs `200ms`), `+950ms` start-offset latency (vs `+180ms`), and `1.54%/h` drain (vs `0.501%/h`).
+
+### Fixed
+
+- **Restored Normal `nice=0` CPU Scheduling Priority (`restore_normal_priority`) & Enabled Nice-Aware `ondemand` Scaling**:
+  - KUAL Kindlet spawns child processes with `nice = 5` (Linux CFS weight `335` vs `1024` for `nice = 0`, an exact `1 / 4.057` CPU share against any `nice = 0` background process, matching the observed `20ms -> 80ms` slow-down), and `ondemand` with `ignore_nice_load=1` ignores `nice > 0` work.
+  - Added `restore_normal_priority()` at the start of `main()` and inside `sanitize_runtime_environment()` to reset `$$` and `RENDER_SERVER_PID` back to `nice = 0`, and set `/sys/devices/system/cpu/cpu0/cpufreq/ondemand/ignore_nice_load` to `0` alongside restoring `scaling_max_freq`.
+- **Fixed `wait_renderer_reply()` Reply-FIFO Token Desynchronization (`fd 9`)**:
+  - Previously, `wait_renderer_reply()` only read a notification token from `fd 9` (`RENDER_REPLY_FIFO`) when `[ ! -f "$STATUS_PATH" ]`. Whenever a fast command (`PING` / `PREPARE`) finished before the shell entered `wait_renderer_reply()`, its `"1\n"` token stayed buffered in `fd 9`, causing the subsequent `WAIT_UNTIL` call to consume the stale token immediately and fall back into the coarse `sleep 1` (1000ms) polling loop (`+950ms` refresh delay).
+  - Unconditionally consumes one reply token per request on `fd 9` and also blocks on `fd 9` inside the wait loop before falling back to `sleep 1`.
+- **Command-Line `/proc/[0-9]*/cmdline` Cleanup of Duokan `/bin/sh` Wrapper Scripts (`sanitize_runtime_environment`)**:
+  - Multi-boot Duokan scripts (`/etc/rc5.d/S96DK_run`, `/etc/rc5.d/S96boot_finished`, `rundk.sh`) run as `/bin/sh` (`comm = sh`), evading name-based `killall -9`.
+  - Expanded `sanitize_runtime_environment()` to scan `/proc/[0-9]*/cmdline`, forcefully terminating any residual `DK_run`, `DK_switch`, `S96DK_run`, `S95DK_switch`, `rundk.sh`, `/DuoKan/`, `DK_System`, `S96boot_finished`, `boot_finished`, `/usr/java/`, or `cvm` process while logging post-sanitization `nice`, CPU governor/frequency, and `/proc/loadavg` diagnostics.
+
 ## 2.6.3 - 2026-11-20
 
 Based on 187.44-hour (7.81-day, `100% -> 6%`, `0.501%/h` average drain, `100%` partial-refresh hit rate across `11,061` ordinary minutes) full-cycle empirical validation of v2.6.2 (`kfc.log`, 15,866 lines).

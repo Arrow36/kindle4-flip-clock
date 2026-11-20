@@ -2,13 +2,28 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.6.3** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.6.4** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.6.4 (Remove KUAL `nice=5` CPU handicap, fix reply-FIFO token desync & `/proc` cleanup of Duokan wrapper shells)
+
+Based on 16-hour v2.6.3 empirical telemetry cross-referenced against Duokan `DIAGNOSTIC.log`, resolving the 4x slower screen updates (`80ms` vs `20ms`), `+950ms` boundary latency, and `1.54%/h` drain after a Duokan `"Switch to kindle"` (`Exit 4`) hot-switch:
+
+1. **Restore Normal `nice=0` Priority (`restore_normal_priority`) & Nice-Aware `ondemand` Scaling**:
+   - **Rationale**: KUAL Kindlet spawns `start.sh` and children with `nice=5` (Linux CFS weight `335` vs `1024`, a 4.057x CPU disadvantage), while `ondemand` with `ignore_nice_load=1` ignores `nice > 0` work.
+   - **Implementation**: Resets `$$` and `RENDER_SERVER_PID` to `nice=0` in `main()` and `sanitize_runtime_environment()`, and sets `ondemand/ignore_nice_load` to `0` while restoring `scaling_max_freq`.
+
+2. **Fix Reply-FIFO (`fd 9`) Token Desynchronization in `wait_renderer_reply()`**:
+   - **Rationale**: Skipping the `fd 9` read whenever a fast command pre-created `$STATUS_PATH` left stale tokens in the pipe, causing the next `WAIT_UNTIL` to immediately fall back to 1-second polling (`sleep 1`).
+   - **Implementation**: Unconditionally consumes one reply token per request on `fd 9` and blocks on `fd 9` inside the wait loop before any `sleep 1` fallback.
+
+3. **Command-Line `/proc/[0-9]*/cmdline` Cleanup of Duokan `/bin/sh` Wrappers**:
+   - **Implementation**: Scans `/proc/[0-9]*/cmdline` to terminate residual `S96DK_run`, `DK_run`, `DK_switch`, `S96boot_finished`, `rundk.sh`, `/DuoKan/`, and `/usr/java/` processes disguised under `sh`, and logs post-sanitization `nice`, CPU governor/frequency, and load average to `kfc.log`.
 
 ## What changed in 2.6.3 (7.81-day battery milestone, unified 3600mV low-battery protection & single-step bimodal mode-jump convergence)
 

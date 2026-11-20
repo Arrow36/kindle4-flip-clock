@@ -514,6 +514,32 @@ SYNC_PID=""
 refresh_battery_sample_after_hourly_full_refresh >/dev/null
 [ "$AUTO_SYNC_DUE" = "0" ]
 
+# Test restore_normal_priority sheds KUAL Kindlet nice=5 handicap
+RENICE_CALLS=""
+nice() { echo 5; }
+renice() { RENICE_CALLS="${RENICE_CALLS}${RENICE_CALLS:+;}$*"; return 0; }
+RENDER_SERVER_PID=4321
+restore_normal_priority
+[ "$RENICE_CALLS" = "-n -5 $$;0 -p 4321" ]
+unset -f nice renice
+
+# Test wait_renderer_reply always drains fd 9 token even when STATUS_PATH already exists
+REPLY_TOKENS="$RUNTIME_DIR/reply_tokens"
+STATUS_FAST="$RUNTIME_DIR/status_fast"
+printf "1\n2\n" > "$REPLY_TOKENS"
+printf "OK PONG\n" > "$STATUS_FAST"
+exec 9<"$REPLY_TOKENS"
+RENDER_SERVER_READY=1
+RENDER_REPLY_READY=1
+RENDER_SERVER_PID=1234
+kill() { return 0; }
+wait_renderer_reply "$STATUS_FAST"
+read -r NEXT_TOKEN <&9
+exec 9<&-
+unset -f kill
+[ "$NEXT_TOKEN" = "2" ]
+[ "$SERVER_REPLY" = "OK PONG" ]
+
 rm -rf "$RUNTIME_DIR"
 
 printf 'refresh timing tests passed\n'
