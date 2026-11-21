@@ -439,6 +439,16 @@ cleanup() {
     "$NEXT_RENDER_WORK" "$NEXT_RENDER_RESULT" "$NEXT_FRAME_META" \
     "$PARTIAL_DISABLED_FILE"
 }
+sanitize_process_environment() {
+  # Shed polluted LD_LIBRARY_PATH (e.g. Duokan's ".:/DuoKan/lib/:../lib/:"),
+  # KUAL Java's LD_PRELOAD (/usr/java/lib/libmicrowindowsawt.so), and
+  # FONTCONFIG_PATH (/DuoKan/res/fontconfig), and move CWD off the FUSE
+  # /mnt/us mount so child exec calls never traverse FUSE on library lookup.
+  unset LD_LIBRARY_PATH LD_PRELOAD FONTCONFIG_PATH 2>/dev/null || true
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  export PATH
+  cd /tmp 2>/dev/null || true
+}
 restore_normal_priority() {
   CURRENT_NICE=$(nice 2>/dev/null) || CURRENT_NICE=""
   if is_uint "$CURRENT_NICE" && [ "$CURRENT_NICE" -gt 0 ]; then
@@ -454,37 +464,49 @@ restore_normal_priority() {
 
 sanitize_runtime_environment() {
   restore_normal_priority
+  if [ -x /etc/init.d/browserd ]; then
+    /etc/init.d/browserd stop >/dev/null 2>&1 || true
+  fi
+  /usr/bin/lipc-set-prop com.lab126.pmond stop browserd >/dev/null 2>&1 || true
   # Terminate residual Duokan background daemons and stray native framework or
   # indexer processes that can survive a Duokan "Switch to Kindle" hot-switch
   # and cause 100% CPU contention or /mnt/us FAT32 I/O stalls.
-  for BG_PROC in KindleApp ebook lcrun UsbSignal.bin BatterySignal.bin \
-                 Charging.bin notCharging.bin PowerState.bin suspending.bin \
-                 mplayer miniftp cvm mesquite webreader phd tmd \
-                 DK_run DK_switch S96DK_run S95DK_switch S96boot_finished \
-                 boot_finished rundk.sh WaiteAKey; do
-    killall -9 "$BG_PROC" >/dev/null 2>&1 || true
-  done
-  killall -9 lipc-wait-event >/dev/null 2>&1 || true
+  killall -9 KindleApp ebook lcrun UsbSignal.bin BatterySignal.bin \
+             Charging.bin notCharging.bin PowerState.bin suspending.bin \
+             mplayer miniftp cvm mesquite browserd webreader phd tmd \
+             DK_run DK_switch S96DK_run S95DK_switch S96boot_finished \
+             boot_finished S96rundk usbsingle.sh S95dkupdate S79showmenu \
+             usb_switch rundk.sh WaiteAKey lipc-wait-event \
+             >/dev/null 2>&1 || true
 
-  # Scan /proc/<pid>/cmdline to catch "/bin/sh /etc/rc5.d/S96DK_run",
-  # "/bin/sh /etc/rc5.d/S96boot_finished", or "/DuoKan/..." wrapper shells
-  # whose process comm is "sh" and therefore invisible to killall.
-  for PROC_CMD in /proc/[0-9]*/cmdline; do
-    [ -r "$PROC_CMD" ] || continue
-    PROC_DIR=${PROC_CMD%/cmdline}
-    PROC_PID=${PROC_DIR#/proc/}
-    is_uint "$PROC_PID" || continue
-    [ "$PROC_PID" -eq "$$" ] && continue
-    [ "$PROC_PID" -eq "${RENDER_SERVER_PID:-0}" ] && continue
-    [ "$PROC_PID" -eq "${KEY_PID:-0}" ] && continue
-    CMD_TEXT=$(tr '\000' ' ' < "$PROC_CMD" 2>/dev/null) || CMD_TEXT=""
-    case "$CMD_TEXT" in
-      *DK_run*|*DK_switch*|*S96DK_run*|*S95DK_switch*|*rundk.sh*|*/DuoKan/*|*DK_System*|*S96boot_finished*|*boot_finished*|*/usr/java/*|*cvm*)
-        kill -9 "$PROC_PID" >/dev/null 2>&1 || true
-        log_message "sanitized stray process: pid=$PROC_PID cmd=$CMD_TEXT"
-        ;;
-    esac
-  done
+  # Scan process list via a single ps + awk pass to catch wrapper shells
+  # (e.g. "/bin/sh /etc/rc5.d/S96DK_run" or "/DuoKan/...") whose comm is "sh"
+  # and therefore invisible to killall, avoiding ~150 slow /proc tr forks.
+  STRAY_PROCS=$(
+    (ps -ef 2>/dev/null || ps -A 2>/dev/null || ps 2>/dev/null) | awk -v self="$$" -v rpid="${RENDER_SERVER_PID:-0}" -v kpid="${KEY_PID:-0}" '
+      NR == 1 {
+        if ($2 == "PID") { pid_col = 2; next }
+        if ($1 == "PID") { pid_col = 1; next }
+        pid_col = 1
+      }
+      {
+        pid = (pid_col == 2 ? $2 : $1)
+        if (pid !~ /^[0-9]+$/) next
+        if (pid == self || pid == rpid || pid == kpid) next
+        if (index($0, "DK_run|DK_switch") > 0 || $0 ~ /awk[ \t]+-v[ \t]+self=/) next
+        if ($0 ~ /(DK_run|DK_switch|S96DK_run|S95DK_switch|S96rundk|usbsingle\.sh|S95dkupdate|S79showmenu|usb_switch|rundk\.sh|\/DuoKan\/|\/test\/DKLite|DK_System|S96boot_finished|boot_finished|\/usr\/java\/|browserd|cvm)/) {
+          print pid "|" $0
+        }
+      }
+    ' 2>/dev/null
+  ) || STRAY_PROCS=""
+  if [ -n "$STRAY_PROCS" ]; then
+    printf '%s\n' "$STRAY_PROCS" | while IFS='|' read -r PROC_PID CMD_TEXT; do
+      is_uint "$PROC_PID" || continue
+      kill -9 "$PROC_PID" >/dev/null 2>&1 || true
+      log_message "sanitized stray process: pid=$PROC_PID cmd=$CMD_TEXT"
+    done
+  fi
 
   CPU_FREQ_DIR="/sys/devices/system/cpu/cpu0/cpufreq"
   if [ -w "$CPU_FREQ_DIR/scaling_governor" ]; then
@@ -508,6 +530,64 @@ sanitize_runtime_environment() {
   [ -r /proc/loadavg ] && read -r CUR_LOAD < /proc/loadavg 2>/dev/null || true
   CUR_NICE=$(nice 2>/dev/null) || CUR_NICE="unknown"
   log_message "runtime environment sanitized: nice=${CUR_NICE} gov=${CUR_GOV:-unknown} freq=${CUR_FREQ:-unknown} load=${CUR_LOAD:-unknown}"
+  if [ "$DEBUG_LOG" = "1" ] && [ -n "${LOG_FILE:-}" ]; then
+    {
+      echo "=== startup ps snapshot ==="
+      (ps -ef 2>/dev/null || ps -A 2>/dev/null || ps 2>/dev/null) || true
+      echo "=== startup proc/stat active+top snapshot ==="
+      cat /proc/[0-9]*/stat 2>/dev/null | awk '
+        {
+          line = $0
+          pid = $1
+          comm = line
+          sub(/^[0-9]+[ \t]+\(/, "", comm)
+          sub(/\)[ \t].*$/, "", comm)
+          rest = line
+          sub(/^.*\)[ \t]+/, "", rest)
+          n = split(rest, f, /[ \t]+/)
+          if (n >= 18) {
+            st = f[1]; ut = f[12] + 0; kt = f[13] + 0; ni = f[17]; th = f[18]
+            tot = ut + kt
+            if (st == "R" || st == "D") {
+              printf "ACTIVE ticks=%010d pid=%s state=%s nice=%s thr=%s comm=%s\n", tot, pid, st, ni, th, comm
+            }
+            printf "TOP    ticks=%010d pid=%s state=%s nice=%s thr=%s comm=%s\n", tot, pid, st, ni, th, comm
+          }
+        }
+      ' 2>/dev/null | sort -r | awk '/^ACTIVE / { print; next } /^TOP / { if (++c <= 15) print }' 2>/dev/null || true
+      echo "=== startup mount snapshot ==="
+      mount 2>/dev/null || true
+      echo "=== startup meminfo snapshot ==="
+      head -n 10 /proc/meminfo 2>/dev/null || true
+      echo "=== startup cpufreq stats ==="
+      cat /sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state 2>/dev/null || true
+      echo "=== startup lsmod snapshot ==="
+      lsmod 2>/dev/null || true
+      echo "=== startup original env ==="
+      echo "ORIG_PWD=${STARTUP_ORIG_PWD:-unknown}"
+      [ -n "${STARTUP_ORIG_ENV:-}" ] && printf '%s\n' "$STARTUP_ORIG_ENV" || true
+      echo "=== startup fb0 holders ==="
+      ls -l /proc/[0-9]*/fd 2>/dev/null | awk '/^\/proc\/[0-9]+\/fd:/ { d=$0; next } /fb0|eink/ { print d, $0 }' 2>/dev/null || true
+      echo "=== startup kernel power/bus/eink state ==="
+      for KFILE in /sys/devices/platform/*busfreq*/enable \
+                   /sys/devices/platform/*dvfs*/enable \
+                   /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor \
+                   /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq \
+                   /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq \
+                   /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq \
+                   /proc/eink_fb/power_level \
+                   /proc/eink_fb/update_display \
+                   /proc/sys/vm/overcommit_memory; do
+        if [ -r "$KFILE" ]; then
+          KVAL=""
+          read -r KVAL < "$KFILE" 2>/dev/null || true
+          echo "$KFILE=$KVAL"
+        fi
+      done
+      echo "=== startup dmesg tail ==="
+      dmesg 2>/dev/null | tail -n 25 || true
+    } >> "$LOG_FILE" 2>/dev/null || true
+  fi
   sync >/dev/null 2>&1 || true
 }
 calc_battery_from_voltage() {
@@ -630,7 +710,7 @@ update_adaptive_drift_trim() {
   # - Cold start or severe regime shifts (|DRIFT_PPM| >= 3000): aggressive 80% step
   #   (clamped to +/-10000 PPM) to converge rapidly in 1-2 hours.
   # - Transition zone (1500 <= |DRIFT_PPM| < 3000): 60% step.
-  # - Steady state (|DRIFT_PPM| < 1500): 50% critical damping to filter noise/jitter.
+  # - Steady state (|DRIFT_PPM| < 1500): 33% damping (1/3) to prevent single-hour noise overshoot.
   ABS_DRIFT_PPM="${DRIFT_PPM#-}"
   MAX_ADAPT_STEP=10000
   if [ "$ABS_DRIFT_PPM" -ge 8000 ] && [ "$EFFECTIVE_SLEPT_SEC" -ge 1800 ]; then
@@ -641,7 +721,7 @@ update_adaptive_drift_trim() {
   elif [ "$ABS_DRIFT_PPM" -ge 1500 ]; then
     ADAPT_STEP=$(( DRIFT_PPM * 3 / 5 ))
   else
-    ADAPT_STEP=$(( DRIFT_PPM / 2 ))
+    ADAPT_STEP=$(( DRIFT_PPM / 3 ))
   fi
   [ "$ADAPT_STEP" -gt "$MAX_ADAPT_STEP" ] && ADAPT_STEP="$MAX_ADAPT_STEP"
   [ "$ADAPT_STEP" -lt "-$MAX_ADAPT_STEP" ] && ADAPT_STEP="-$MAX_ADAPT_STEP"
@@ -674,12 +754,12 @@ update_adaptive_drift_trim() {
   if ! is_uint "$CONVERGED_DURATION_SEC" || [ "$CONVERGED_DURATION_SEC" -lt 3600 ]; then
     CONVERGED_DURATION_SEC="$ELAPSED_SEC"
   fi
-  # Allow realistic diurnal crystal temperature drift (~2.8s/hr, 800 PPM)
-  CONVERGED_MAX_OFFSET_MS=$(( 2000 + (CONVERGED_DURATION_SEC * 800) / 1000 ))
+  # Allow realistic diurnal crystal temperature drift (~3.6s/hr, 1000 PPM)
+  CONVERGED_MAX_OFFSET_MS=$(( 2000 + (CONVERGED_DURATION_SEC * 1000) / 1000 ))
   [ "$CONVERGED_MAX_OFFSET_MS" -lt 2000 ] && CONVERGED_MAX_OFFSET_MS=2000
   [ "$CONVERGED_MAX_OFFSET_MS" -gt 10000 ] && CONVERGED_MAX_OFFSET_MS=10000
   ABS_OFFSET_MS="${EFFECTIVE_OFFSET_MS#-}"
-  if [ "$ABS_DRIFT_PPM" -le 800 ] && [ "$ABS_OFFSET_MS" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
+  if [ "$ABS_DRIFT_PPM" -le 1000 ] && [ "$ABS_OFFSET_MS" -le "$CONVERGED_MAX_OFFSET_MS" ]; then
     DRIFT_CONVERGED_STREAK=$((DRIFT_CONVERGED_STREAK + 1))
   else
     DRIFT_CONVERGED_STREAK=0
@@ -1927,6 +2007,9 @@ publish_minute_frame() {
   return 1
 }
 main() {
+  STARTUP_ORIG_PWD=$(pwd 2>/dev/null) || STARTUP_ORIG_PWD="unknown"
+  STARTUP_ORIG_ENV=$(env 2>/dev/null) || STARTUP_ORIG_ENV=""
+  sanitize_process_environment
   mkdir -p "$RUNTIME_DIR" "$LOG_DIR"
   restore_normal_priority
   rm -f "$EXIT_FILE" "$KEY_EVENT_FILE" "$KEY_EVENT_FILE.tmp" \

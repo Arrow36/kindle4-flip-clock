@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here.
 
+## 2.6.5 - 2026-11-22
+
+Based on controlled A/B native cold-boot vs Duokan `"Switch to kindle"` (`Exit 4`) hot-switch diagnostics (`kfc.log` / `DIAGNOSTIC.log`) and multi-hour convergence telemetry, eliminating the root cause of the residual ~3x post-Duokan slowdown and FUSE I/O drain.
+
+### Fixed
+
+- **Root-Cause Elimination of Duokan Hot-Switch 3x Slowdown & FUSE Exec Penalty (`sanitize_process_environment`)**:
+  - Controlled cold-boot vs `Exit 4` hot-switch environment capture revealed that Duokan's hot-switch leaves `/etc/init.d/framework` running with `LD_LIBRARY_PATH=.:/DuoKan/lib/:../lib/:` (trailing colon also searches `.`), `FONTCONFIG_PATH=/DuoKan/res/fontconfig`, KUAL Java's `LD_PRELOAD=/usr/java/lib/libmicrowindowsawt.so`, and KUAL's `PWD=/mnt/us/extensions/kfc`. Every child `exec()` (`eips`, `date`, `rm`, `lipc-get-prop`) forced `ld.so` to resolve `.` and preload Java AWT through the `/mnt/us` FUSE daemon (`fsp`), adding ~200ms per command, pushing `fsp` startup CPU from `1.66s` to `18.16s`, inflating `wait_for_wifi` 20s timeouts to `30–34s`, and stretching per-minute awake time from `2.93s` to `4.87s`.
+  - Added `sanitize_process_environment()` at the top of `main()` to unset `LD_LIBRARY_PATH`, `LD_PRELOAD`, and `FONTCONFIG_PATH`, reset `PATH` to clean system directories, and `cd /tmp` off `/mnt/us`. Verified post-Duokan `Exit 4` telemetry immediately matched cold boot: `full_refresh` dropped from `600ms` to `190ms`, `start_offset_ms` improved from `+350..+1250ms` to `-350..+20ms`, normal-minute awake duration halved from `4.87s` to `2.52s` (`4.2%` duty cycle), `wait_for_wifi` timeouts normalized to `21s`, and `fsp` startup CPU dropped 85% (`18.16s -> 2.79s`).
+- **Clean `browserd` Teardown (`eink_fb_hal` Refcount `4 -> 3`) & 3s Startup Sanitization (`sanitize_runtime_environment`)**:
+  - Full-system `ps -ef` and `lsmod` diff identified a lingering `pmond`-managed `/usr/bin/browserd` (`state=T`, 7 threads, zombie `sh`) surviving `/etc/init.d/framework stop` and holding `/dev/fb0` (`eink_fb_hal` refcount `4` vs native `3`). Added `/etc/init.d/browserd stop`, `lipc-set-prop com.lab126.pmond stop browserd`, and `browserd` to the `killall -9` / `ps | awk` cleanup lists, restoring `eink_fb_hal` refcount to `3`.
+  - Replaced the 23-iteration `killall` loop and ~148 `/proc/[0-9]*/cmdline` `tr` forks (`37s` startup stall in v2.6.4) with a single multi-argument `killall -9` (expanded with `S96rundk`, `usbsingle.sh`, `S95dkupdate`, `S79showmenu`, `usb_switch`, `/test/DKLite`) and a single `ps | awk` pass, cutting sanitization time from `37s` to `3s` (-92%), and gated BusyBox-compatible diagnostic snapshots behind `DEBUG_LOG=1`.
+
+### Changed
+
+- **Anti-Oscillation Steady-State Drift Convergence (`update_adaptive_drift_trim`)**:
+  - Raised the steady-state convergence tolerance in `update_adaptive_drift_trim()` from `800` to `1000 PPM` (keeping the `10s` offset cap and `15s` error fuse unchanged) and softened steady-state (`|DRIFT_PPM| < 1500`) damping from `1/2` to `1/3`, preventing 1-second integer quantization residuals (~873–885 PPM) from overshooting `trim` (`3935 -> 3493 -> 3929ppm`) and repeatedly resetting `DRIFT_CONVERGED_STREAK` back to 1h syncs.
+
 ## 2.6.4 - 2026-11-20
 
 Based on 16-hour v2.6.3 empirical telemetry (`kfc.log`, 1,402 lines) cross-referenced against Duokan `DIAGNOSTIC.log` and 8 historical runs, resolving why launches immediately after a Duokan `"Switch to kindle"` (`Exit 4`) hot-switch exhibited `80ms` partial refreshes (vs `20ms`), `620ms` full refreshes (vs `200ms`), `+950ms` start-offset latency (vs `+180ms`), and `1.54%/h` drain (vs `0.501%/h`).

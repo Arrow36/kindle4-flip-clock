@@ -2,13 +2,25 @@
 
 [中文说明](README.md) · A full-screen KUAL flip-clock-style display for the Kindle 4 Non-Touch (K4NT).
 
-**Current version: 2.6.4** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
+**Current version: 2.6.5** · [Download the latest release](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [Changelog](CHANGELOG.md)
 
 ![kfc preview](docs/preview.svg)
 
 The extension shows the time, Gregorian date, weekday, Chinese lunar date, and battery level. Screen orientation, 12/24-hour mode, and light/dark themes are controlled with the Kindle's physical keys while the clock is running.
 
 The current release caches digit cards, prepares only the changed part of the next minute, and publishes that region directly through the framebuffer without an animated transition.
+
+## What changed in 2.6.5 (Eliminate Duokan hot-switch `LD_LIBRARY_PATH`/`LD_PRELOAD` FUSE slowdown & `browserd` leak, 3s sanitization & anti-oscillation drift convergence)
+
+Based on controlled A/B native cold-boot vs Duokan `"Switch to kindle"` (`Exit 4`) system telemetry, eliminating the root causes behind the residual 3x slower full refreshes (`600ms -> 190ms`), elevated awake duty cycle (`4.87s/min -> 2.52s/min`), and `eink_fb_hal` handle leak after hot-switching from Duokan:
+
+1. **Process Environment & Working-Directory Sanitization (`sanitize_process_environment`)**:
+   - **Rationale**: A/B capture revealed that Duokan hot-switches leave `framework` and KUAL children inheriting `LD_LIBRARY_PATH=.:/DuoKan/lib/:../lib/:`, `FONTCONFIG_PATH=/DuoKan/res/fontconfig`, KUAL Java's `LD_PRELOAD=/usr/java/lib/libmicrowindowsawt.so`, and `PWD=/mnt/us/extensions/kfc`. Every short-lived child command (`eips`, `date`, `lipc-get-prop`) resolved `.` and preloaded Java AWT through the `/mnt/us` FUSE daemon (`fsp`), adding ~200ms per `exec()`, inflating `fsp` startup CPU 11x (`18.16s` vs `1.66s`), dragging 20s `wait_for_wifi` timeouts to `30–34s`, and stretching awake time to `4.87s/min`.
+   - **Implementation**: Clears `LD_LIBRARY_PATH`, `LD_PRELOAD`, and `FONTCONFIG_PATH`, resets `PATH`, and switches CWD to `/tmp` at the top of `main()`. Verified post-Duokan telemetry matched native cold boot: PNG full refresh dropped from **`600ms` to `190ms`**, `start_offset_ms` improved from `+350..+1250ms` to **`-350..+20ms`**, awake time halved to **`2.52s/min` (`4.2%` duty cycle)**, Wi-Fi timeout normalized to `21s`, and `fsp` startup CPU fell 85% (`2.79s`).
+2. **Clean `browserd` Teardown (`eink_fb_hal` Refcount `4 -> 3`) & 3s Startup Sanitization**:
+   - **Implementation**: Stops `pmond`-managed `/usr/bin/browserd` (`/etc/init.d/browserd stop`, `lipc-set-prop com.lab126.pmond stop browserd`, and `killall -9`), dropping `eink_fb_hal` open handle count back from `4` to native `3`. Replaces the 23-iteration `killall` loop and ~148 `/proc/*/cmdline` `tr` forks (`37s` stall in v2.6.4) with a single multi-argument `killall -9` (also covering `S96rundk`, `usbsingle.sh`, `S95dkupdate`, `S79showmenu`, `usb_switch`, `/test/DKLite`) and a single `ps | awk` pass (`3s`, -92%), while gating verbose diagnostic snapshots behind `DEBUG_LOG=1`.
+3. **Anti-Oscillation Steady-State Drift Convergence (`update_adaptive_drift_trim`)**:
+   - **Implementation**: Widens steady-state convergence tolerance from `800` to **`1000 PPM`** (retaining the `10s` offset cap and `15s` error fuse) and softens small-residual (`|DRIFT_PPM| < 1500`) step damping from `1/2` to **`1/3`**, preventing single-hour integer quantization noise (~873–885 PPM) from overshooting `trim` and resetting `DRIFT_CONVERGED_STREAK`.
 
 ## What changed in 2.6.4 (Remove KUAL `nice=5` CPU handicap, fix reply-FIFO token desync & `/proc` cleanup of Duokan wrapper shells)
 

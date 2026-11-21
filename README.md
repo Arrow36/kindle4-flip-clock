@@ -2,13 +2,26 @@
 
 [English](README_EN.md) · 专为 Kindle 4 Non-Touch（K4NT）制作的 KUAL 全屏翻页时钟。
 
-**当前版本：2.6.4** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
+**当前版本：2.6.5** · [下载最新版](https://github.com/Arrow36/kindle4-flip-clock/releases/latest) · [更新记录](CHANGELOG.md)
 
 ![kfc 预览](docs/preview.svg)
 
 它把闲置的 Kindle 4 变成一块墨水屏时钟：显示时间、公历日期、星期、农历和电量，并可通过实体按键直接切换方向、12/24 小时制和浅深色主题。
 
 > 当前版本采用“翻页钟外观 + 数字卡片缓存 + 下一分钟变化区域预生成”。普通分钟只更新发生变化的一至两个数字，不生成完整 PNG，也没有中间过渡帧。
+
+## 2.6.5 的主要修改（彻底根治多看热切 3 倍降速与 `browserd` 句柄泄漏、3 秒极速清理与稳态防振荡收敛）
+
+基于同机“原生冷启 vs 多看热切（`Exit 4`）”全系统 A/B 对照取证，锁定并根除了多看热切后残留至今的全刷 3 倍变慢（`600ms -> 190ms`）、高频 FUSE 唤醒（`4.87s/min -> 2.52s/min`）与 `eink_fb_hal` 句柄泄漏，实机热切表现已全面恢复至原生冷启最优水平：
+
+1. **进程入口环境变量与工作目录净化（`sanitize_process_environment`）**
+   - **修改理由**：冷热启动 `env` 对照捕获到多看热切后 `framework -> KUAL` 遗留了 `LD_LIBRARY_PATH=.:/DuoKan/lib/:../lib/:`、`FONTCONFIG_PATH=/DuoKan/res/fontconfig`、`LD_PRELOAD=/usr/java/lib/libmicrowindowsawt.so` 及 `/mnt/us/extensions/kfc` 工作目录。每次执行 `eips`、`date`、`lipc-get-prop` 等外部命令都会强行预加载 Java AWT 库并穿透 `/mnt/us` FUSE 服务（`fsp`）搜索当前目录，导致每次 `exec` 多卡 ~200ms、启动期 `fsp` CPU 暴涨 11 倍（`18.16s` vs `1.66s`）、`wait_for_wifi` 20 秒超时拖成 30–34 秒。
+   - **技术实现**：`main()` 启动即调用 `sanitize_process_environment()` 清除 `LD_LIBRARY_PATH` / `LD_PRELOAD` / `FONTCONFIG_PATH`、重置纯净 `PATH` 并 `cd /tmp` 脱离 FUSE 挂载点。热切实测首帧全刷从 **`600ms` 降至 `190ms`**，切屏偏差从 `+350..+1250ms` 回到 **`-350..+20ms`**，单分唤醒从 `4.87s` 砍半至 **`2.52s`（占空比 4.2%）**，`fsp` 启动耗时骤降 **85%**（`2.79s`）。
+2. **清理残留 `browserd`（`eink_fb_hal` 引用 `4 -> 3`）与 3 秒极速启动净化**
+   - **修改理由**：全系统进程与 `lsmod` 差分显示 `pmond` 管理的 `/usr/bin/browserd`（`state=T`, 7 线程）在停掉框架后仍占用 `/dev/fb0`（`eink_fb_hal` 引用计数为 `4`，原生为 `3`）；同时 v2.6.4 的 148 次 `/proc/*/cmdline` `tr` 子进程在热切下耗时 37 秒。
+   - **技术实现**：通过 `/etc/init.d/browserd stop` + `pmond stop browserd` + `killall -9` 清理 `browserd`（实测 `eink_fb_hal` 引用立即降回 **`3`**）；将清理改为单条多参数 `killall -9`（补充 `S96rundk`、`usbsingle.sh` 等多看脚本）与单次 `ps | awk` 扫描，清理耗时由 **37 秒缩至 3 秒**（-92%），并将详细诊断快照收敛至 `DEBUG_LOG=1` 按需开启。
+3. **稳态晶振校准防振荡与 2 小时巡航保持（`update_adaptive_drift_trim`）**
+   - **技术实现**：将稳态收敛判定线从 `800 PPM` 微调至 **`1000 PPM`**（保留 `10s` 偏移上限与 `15s` 熔断保护），并将小残差区（`|DRIFT_PPM| < 1500`）步长阻尼从 `1/2` 平滑为 **`1/3`**，避免单小时 `date +%s` 整秒量化噪声在 ~880 PPM 边缘来回过冲并频繁重置 `DRIFT_CONVERGED_STREAK`。
 
 ## 2.6.4 的主要修改（解除 KUAL `nice=5` 优先级限制、修复回复管道令牌错位与深度清理多看脚本残留）
 

@@ -103,30 +103,30 @@ ADAPTIVE_PPM_TRIM=0
 SYNC_STAT_FILE="$RUNTIME_DIR/last_sntp_sync"
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "250" ]
-[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "250" ]
-[ "$(cat "$TRIM_PERSIST_FILE")" = "250" ]
+[ "$ADAPTIVE_PPM_TRIM" = "166" ]
+[ "$(cat "$RUNTIME_DIR/adaptive_ppm.trim")" = "166" ]
+[ "$(cat "$TRIM_PERSIST_FILE")" = "166" ]
 [ ! -f "$SYNC_STAT_FILE" ]
 
-# Steady-state zone (< 1500 PPM): 50% critical damping
+# Steady-state zone (< 1500 PPM): 33% damping (1/3)
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=400\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "450" ]
+[ "$ADAPTIVE_PPM_TRIM" = "299" ]
 
 # Transition zone (1500 <= |PPM| < 3000): 60% step (2000 * 3 / 5 = 1200)
 printf "OFFSET_MS=-7200\nELAPSED_SEC=3600\nDRIFT_PPM=2000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "1650" ]
+[ "$ADAPTIVE_PPM_TRIM" = "1499" ]
 
 # Aggressive zone (|PPM| >= 3000): 80% step (-5000 * 4 / 5 = -4000)
 printf "OFFSET_MS=18000\nELAPSED_SEC=3600\nDRIFT_PPM=-5000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "-2350" ]
+[ "$ADAPTIVE_PPM_TRIM" = "-2501" ]
 
 # Large residual: step capped at 10000 PPM
 printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "-12350" ]
+[ "$ADAPTIVE_PPM_TRIM" = "-12501" ]
 
 # Anti-windup: trim stops where effective PPM reaches -8000 (trim = -13400)
 printf "OFFSET_MS=72000\nELAPSED_SEC=3600\nDRIFT_PPM=-20000\n" > "$SYNC_STAT_FILE"
@@ -283,14 +283,14 @@ render_current_frame
 [ "$BATTERY_LEVEL" = 82 ]
 
 # Test ACCUMULATED_SLEPT_SECONDS denominator in update_adaptive_drift_trim
-# OFFSET_MS=-1800ms over ELAPSED_SEC=3600s (naive 500ppm), but actual sleep was 1800s -> true residual is 1000ppm -> 50% step = +500ppm
+# OFFSET_MS=-1800ms over ELAPSED_SEC=3600s (naive 500ppm), but actual sleep was 1800s -> true residual is 1000ppm -> 1/3 step = +333ppm
 get_battery_voltage() { echo 4000; }
 rm -f "$RUNTIME_DIR/battery.volt"
 ADAPTIVE_PPM_TRIM=0
 ACCUMULATED_SLEPT_SECONDS=1800
 printf "OFFSET_MS=-1800\nELAPSED_SEC=3600\nDRIFT_PPM=500\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "500" ]
+[ "$ADAPTIVE_PPM_TRIM" = "333" ]
 [ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
 
 # Test synchronous partial pre-render when PARTIAL_ELIGIBLE=1 (zero background subshell fork)
@@ -354,12 +354,22 @@ try_rtc_suspend 3700 2>/dev/null || REJECT_STATUS=$?
 [ "$ACCUMULATED_SLEPT_SECONDS" = "0" ]
 rmdir "$POWER_STATE_PATH"
 
-# Test 2-hour convergence retention (slept=7000s, offset=-4900ms -> 700ppm <= 800ppm and offset <= 10000ms stays converged)
+# Test 2-hour convergence retention (slept=7000s, offset=-4900ms -> 700ppm <= 1000ppm and offset <= 10000ms stays converged)
 DRIFT_CONVERGED_STREAK=2
 ACCUMULATED_SLEPT_SECONDS=7000
 printf "OFFSET_MS=-4900\nELAPSED_SEC=7200\nDRIFT_PPM=700\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
 [ "$DRIFT_CONVERGED_STREAK" = "3" ]
+
+# Test 1000ppm steady-state convergence retention and 1/3 damping (avoids 885ppm oscillation reset)
+DRIFT_CONVERGED_STREAK=1
+ADAPTIVE_PPM_TRIM=-1465
+DRIFT_REMAINDER_MS=234
+ACCUMULATED_SLEPT_SECONDS=3383
+printf "OFFSET_MS=2760\nELAPSED_SEC=3607\nDRIFT_PPM=-765\n" > "$SYNC_STAT_FILE"
+update_adaptive_drift_trim
+[ "$ADAPTIVE_PPM_TRIM" = "-1760" ]
+[ "$DRIFT_CONVERGED_STREAK" = "2" ]
 
 # Test > 15s offset trips the error fuse even when sample is rejected for trim learning (ELAPSED < 600s)
 DRIFT_CONVERGED_STREAK=3
@@ -374,7 +384,7 @@ ADAPTIVE_PPM_TRIM=0
 ACCUMULATED_SLEPT_SECONDS=31000
 printf "OFFSET_MS=18600\nELAPSED_SEC=32418\nDRIFT_PPM=-600\n" > "$SYNC_STAT_FILE"
 update_adaptive_drift_trim
-[ "$ADAPTIVE_PPM_TRIM" = "-300" ]
+[ "$ADAPTIVE_PPM_TRIM" = "-200" ]
 [ "$DRIFT_CONVERGED_STREAK" = "0" ]
 
 # Test large offset > 120s is calibrated rather than dropped (fixes permanent calibration deadlock)
@@ -539,6 +549,19 @@ exec 9<&-
 unset -f kill
 [ "$NEXT_TOKEN" = "2" ]
 [ "$SERVER_REPLY" = "OK PONG" ]
+
+# Test sanitize_process_environment clears Duokan/KUAL polluted env vars and resets PATH
+(
+  LD_LIBRARY_PATH=".:/DuoKan/lib/:../lib/:"
+  LD_PRELOAD="/usr/java/lib/libmicrowindowsawt.so"
+  FONTCONFIG_PATH="/DuoKan/res/fontconfig"
+  export LD_LIBRARY_PATH LD_PRELOAD FONTCONFIG_PATH
+  sanitize_process_environment
+  [ -z "${LD_LIBRARY_PATH:-}" ]
+  [ -z "${LD_PRELOAD:-}" ]
+  [ -z "${FONTCONFIG_PATH:-}" ]
+  [ "$PATH" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ]
+)
 
 rm -rf "$RUNTIME_DIR"
 
